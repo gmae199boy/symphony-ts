@@ -8,7 +8,7 @@
  *   - All existing IDs are seeded as "seen".
  *   - If the last actionable review is CHANGES_REQUESTED, a changes_requested
  *     event is emitted.
- *   - If the last comment is from a non-bot, a new_comment event is emitted.
+ *   - If the last comment is from a non-bot, a new_comments event is emitted.
  */
 
 import { logger } from '../logger.js';
@@ -24,18 +24,23 @@ interface PRSeen {
 
 interface PollerState {
   seen: Map<number, PRSeen>; // pr_number -> seen IDs
+  knownOpenPRs: Map<number, PullRequest>; // pr_number -> last-known open PR
   firstPoll: boolean;
 }
 
-type RepoClient =
-  | { kind: 'github'; client: GitHubClient }
-  | { kind: 'bitbucket'; client: BitbucketClient };
+interface RepoClientApi {
+  fetchOpenPRs(): Promise<PullRequest[]>;
+  fetchPR(prNumber: number): Promise<PullRequest | null>;
+  deleteBranch(branchName: string): Promise<void>;
+  fetchPRReviews(prNumber: number): Promise<Review[]>;
+  fetchPRComments(prNumber: number): Promise<Comment[]>;
+}
 
 export class RepoPoller {
   private readonly config: RepositoryConfig;
-  private readonly repoClient: RepoClient;
+  private readonly repoClient: RepoClientApi;
   private readonly onEvent: RepoEventHandler;
-  private state: PollerState = { seen: new Map(), firstPoll: true };
+  private state: PollerState = { seen: new Map(), knownOpenPRs: new Map(), firstPoll: true };
   private timer: NodeJS.Timeout | null = null;
 
   constructor(config: RepositoryConfig, onEvent: RepoEventHandler) {
@@ -43,9 +48,9 @@ export class RepoPoller {
     this.onEvent = onEvent;
 
     if (config.kind === 'github') {
-      this.repoClient = { kind: 'github', client: new GitHubClient(config) };
+      this.repoClient = new GitHubClient(config);
     } else {
-      this.repoClient = { kind: 'bitbucket', client: new BitbucketClient(config) };
+      this.repoClient = new BitbucketClient(config);
     }
   }
 
@@ -100,16 +105,59 @@ export class RepoPoller {
       `Repository poller: found ${prs.length} tracked PR(s) in ${label}${this.state.firstPoll ? ' (first poll)' : ''}`,
     );
 
+    // Detect PRs that disappeared from the open list (potentially merged)
+    if (!this.state.firstPoll) {
+      await this.detectMergedPRs(prs);
+    }
+
     for (const pr of prs) {
       await this.checkPR(pr);
     }
+
+    // Update known open PRs
+    this.state.knownOpenPRs = new Map(prs.map((pr) => [pr.number, pr]));
 
     this.state.firstPoll = false;
   }
 
   private async fetchOpenPRs(): Promise<PullRequest[]> {
-    if (this.repoClient.kind === 'github') return this.repoClient.client.fetchOpenPRs();
-    return this.repoClient.client.fetchOpenPRs();
+    return this.repoClient.fetchOpenPRs();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Merged PR detection
+  // ---------------------------------------------------------------------------
+
+  private async detectMergedPRs(currentOpenPRs: PullRequest[]): Promise<void> {
+    const currentOpenNumbers = new Set(currentOpenPRs.map((pr) => pr.number));
+
+    for (const [prNumber, knownPR] of this.state.knownOpenPRs) {
+      if (currentOpenNumbers.has(prNumber)) continue;
+
+      // PR disappeared from open list — fetch its current state
+      try {
+        const pr = await this.fetchPR(prNumber);
+        if (pr && pr.state === 'merged') {
+          logger.info(`Repository poller: PR #${prNumber} has been merged`);
+          this.emit({ kind: 'pr_merged', pr: knownPR });
+        } else {
+          logger.debug(`Repository poller: PR #${prNumber} disappeared but state=${pr?.state ?? 'unknown'}, ignoring`);
+        }
+      } catch (err) {
+        logger.debug('Repository poller: failed to check disappeared PR', { pr: prNumber, error: String(err) });
+      }
+
+      // Clean up seen data for this PR
+      this.state.seen.delete(prNumber);
+    }
+  }
+
+  private async fetchPR(prNumber: number): Promise<PullRequest | null> {
+    return this.repoClient.fetchPR(prNumber);
+  }
+
+  async deleteBranch(branchName: string): Promise<void> {
+    return this.repoClient.deleteBranch(branchName);
   }
 
   // ---------------------------------------------------------------------------
@@ -142,13 +190,11 @@ export class RepoPoller {
   }
 
   private async fetchPRReviews(prNumber: number): Promise<Review[]> {
-    if (this.repoClient.kind === 'github') return this.repoClient.client.fetchPRReviews(prNumber);
-    return this.repoClient.client.fetchPRReviews(prNumber);
+    return this.repoClient.fetchPRReviews(prNumber);
   }
 
   private async fetchPRComments(prNumber: number): Promise<Comment[]> {
-    if (this.repoClient.kind === 'github') return this.repoClient.client.fetchPRComments(prNumber);
-    return this.repoClient.client.fetchPRComments(prNumber);
+    return this.repoClient.fetchPRComments(prNumber);
   }
 
   // ---------------------------------------------------------------------------
@@ -207,26 +253,26 @@ export class RepoPoller {
       return allIds;
     }
 
-    const newComments = comments.filter((c) => !seenIds.has(c.id) && !c.isBot);
-    for (const comment of newComments) {
-      this.emit({ kind: 'new_comment', pr, comment });
+    const allNew = comments.filter((c) => !seenIds.has(c.id));
+    const humanNew = allNew.filter((c) => !c.isBot);
+    if (humanNew.length > 0) {
+      this.emit({ kind: 'new_comments', pr, comments: humanNew });
     }
 
+    // Add all new comments (including bot) to seen set
     const updated = new Set(seenIds);
-    newComments.forEach((c) => updated.add(c.id));
+    allNew.forEach((c) => updated.add(c.id));
     return updated;
   }
 
   private handleFirstPollComments(pr: PullRequest, comments: Comment[]): void {
     const last = comments[comments.length - 1];
-    if (!last) return;
+    if (!last || last.isBot) return;
 
-    if (!last.isBot) {
-      logger.info(
-        `Repository poller: first poll detected unanswered comment by ${last.authorLogin} on PR #${pr.number}`,
-      );
-      this.emit({ kind: 'new_comment', pr, comment: last });
-    }
+    logger.info(
+      `Repository poller: first poll detected unanswered comment by ${last.authorLogin} on PR #${pr.number}`,
+    );
+    this.emit({ kind: 'new_comments', pr, comments: [last] });
   }
 
   // ---------------------------------------------------------------------------
@@ -234,7 +280,7 @@ export class RepoPoller {
   // ---------------------------------------------------------------------------
 
   private emit(event: RepoEvent): void {
-    logger.info(`Repository PR event: ${event.kind} pr=#${event.pr.number} linearIssueId=${event.pr.linearIssueId ?? 'null'}`);
+    logger.info(`Repository PR event: ${event.kind} pr=#${event.pr.number} issueIdentifier=${event.pr.issueIdentifier ?? 'null'}`);
     try {
       this.onEvent(event);
     } catch (err) {

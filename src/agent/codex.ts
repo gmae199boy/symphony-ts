@@ -8,6 +8,7 @@
 import { spawn, ChildProcess } from 'node:child_process';
 import { z } from 'zod';
 import { logger } from '../logger.js';
+import { issueCtx } from '../utils.js';
 import type { Issue, AgentBackend, AgentRunOpts, AgentRunResult, AgentMessage } from '../types.js';
 import type { CodexAgentConfig } from '../config/schema.js';
 
@@ -67,8 +68,18 @@ export class CodexBackend implements AgentBackend {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
+    // Abort signal support — kill child process when signal fires
+    const onAbort = () => { child.kill('SIGTERM'); };
+    if (opts.signal) {
+      if (opts.signal.aborted) {
+        child.kill('SIGTERM');
+        throw new Error('Codex run aborted');
+      }
+      opts.signal.addEventListener('abort', onAbort, { once: true });
+    }
+
     try {
-      const sessionId = `session-${++sessionCounter}`;
+      const sessionId = `session-${Date.now()}-${++sessionCounter}`;
 
       await rpcCall(child, sessionId, 'session.start', {
         workdir: workspace,
@@ -78,10 +89,11 @@ export class CodexBackend implements AgentBackend {
 
       const result = await this.runTurn(child, sessionId, prompt, opts.onMessage);
 
-      await rpcCall(child, `stop-${sessionId}`, 'session.stop', {}).catch(() => undefined);
+      await rpcCall(child, `stop-${sessionId}`, 'session.stop', {}, 5_000).catch(() => undefined);
 
       return result;
     } finally {
+      opts.signal?.removeEventListener('abort', onAbort);
       child.kill();
     }
   }
@@ -126,9 +138,16 @@ function rpcCall(
   id: string | number,
   method: string,
   params: unknown,
+  timeoutMs = 60_000,
 ): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const request: JsonRpcRequest = { jsonrpc: '2.0', id, method, params };
+    let settled = false;
+
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`RPC call ${method} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
 
     let buf = '';
 
@@ -152,8 +171,7 @@ function rpcCall(
         if (!msg.success) continue;
 
         if (msg.data.id === id) {
-          child.stdout?.off('data', onData);
-
+          cleanup();
           if (msg.data.error) {
             reject(
               new Error(
@@ -167,21 +185,33 @@ function rpcCall(
       }
     };
 
-    child.stdout?.on('data', onData);
-    child.stdin?.write(JSON.stringify(request) + '\n');
-
-    child.once('error', (err) => {
-      child.stdout?.off('data', onData);
+    const onError = (err: Error) => {
+      cleanup();
       reject(err);
-    });
+    };
 
-    child.once('close', () => {
-      child.stdout?.off('data', onData);
+    const onClose = () => {
+      cleanup();
       reject(new Error('Codex process exited before RPC response'));
-    });
-  });
-}
+    };
 
-function issueCtx(issue: Issue): string {
-  return `issue_identifier=${issue.identifier}`;
+    const cleanup = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.stdout?.off('data', onData);
+      child.off('error', onError);
+      child.off('close', onClose);
+    };
+
+    child.stdout?.on('data', onData);
+    child.on('error', onError);
+    child.on('close', onClose);
+    try {
+      child.stdin?.write(JSON.stringify(request) + '\n');
+    } catch (err) {
+      cleanup();
+      reject(err instanceof Error ? err : new Error(String(err)));
+    }
+  });
 }

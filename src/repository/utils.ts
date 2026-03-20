@@ -20,9 +20,4 @@ export function isBotLogin(login: string): boolean {
   );
 }
 
-/** Parse a date string, returning null on failure. */
-export function parseDate(raw: string | null | undefined): Date | null {
-  if (!raw) return null;
-  const d = new Date(raw);
-  return isNaN(d.getTime()) ? null : d;
-}
+export { parseDate } from '../utils.js';

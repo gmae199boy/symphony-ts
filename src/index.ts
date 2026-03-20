@@ -15,6 +15,7 @@ import path from 'node:path';
 import process from 'node:process';
 import { loadWorkflow } from './config/loader.js';
 import { Orchestrator } from './orchestrator.js';
+import { ConcurrencyLimiter } from './concurrency-limiter.js';
 import { logger } from './logger.js';
 
 // ---------------------------------------------------------------------------
@@ -63,21 +64,35 @@ async function main(): Promise<void> {
     `Symphony starting: ${config.trackers.length} tracker(s), agents=[${agentKinds}], workspace_backend=${config.workspace_backend}`,
   );
 
+  // Global concurrency limiter — shared across all orchestrators
+  const limiter = new ConcurrencyLimiter(config.agent.max_concurrent_agents);
+
   // One Orchestrator per tracker
   const orchestrators = config.trackers.map(
-    (trackerConfig) => new Orchestrator(config, trackerConfig, promptTemplate),
+    (trackerConfig) => new Orchestrator(config, trackerConfig, promptTemplate, limiter),
   );
 
   // Graceful shutdown
-  const shutdown = (signal: string) => {
-    logger.info(`Received ${signal}; shutting down`);
-    orchestrators.forEach((o) => o.stop());
-    // Give running agents time to complete gracefully
-    setTimeout(() => process.exit(0), 3_000);
+  let shuttingDown = false;
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+
+    logger.info(`Received ${signal}; shutting down gracefully`);
+
+    // Hard fallback in case graceful shutdown hangs
+    const hardTimeout = setTimeout(() => {
+      logger.warn('Hard shutdown timeout reached; forcing exit');
+      process.exit(1);
+    }, 35_000);
+    hardTimeout.unref();
+
+    await Promise.allSettled(orchestrators.map((o) => o.stopAndWait(30_000)));
+    process.exit(0);
   };
 
-  process.on('SIGINT', () => shutdown('SIGINT'));
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
   // Start all orchestrators
   orchestrators.forEach((o) => {

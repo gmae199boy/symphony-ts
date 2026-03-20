@@ -7,6 +7,8 @@
 
 import { z } from 'zod';
 import { logger } from '../logger.js';
+import { fetchWithRetry } from '../fetch-retry.js';
+import { parseDate } from '../utils.js';
 import type { Issue, TrackerClient } from '../types.js';
 import type { JiraTrackerConfig } from '../config/schema.js';
 
@@ -39,11 +41,11 @@ const JiraIssueSchema = z.object({
   fields: JiraIssueFieldsSchema,
 });
 
+/** Response from GET /rest/api/3/search/jql (JQL enhanced search). */
 const JiraSearchResponseSchema = z.object({
   issues: z.array(JiraIssueSchema),
-  total: z.number(),
-  startAt: z.number(),
-  maxResults: z.number(),
+  isLast: z.boolean(),
+  nextPageToken: z.string().optional(),
 });
 
 const JiraMyselfSchema = z.object({
@@ -64,6 +66,20 @@ const JiraTransitionsResponseSchema = z.object({
 // ---------------------------------------------------------------------------
 
 type JiraIssue = z.infer<typeof JiraIssueSchema>;
+
+// ---------------------------------------------------------------------------
+// JQL escaping helpers
+// ---------------------------------------------------------------------------
+
+/** Escape a value for use inside a JQL double-quoted string. */
+function jqlEscape(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+/** Wrap a value as a safely-escaped JQL string literal. */
+function jqlString(value: string): string {
+  return `"${jqlEscape(value)}"`;
+}
 
 // ---------------------------------------------------------------------------
 // Client
@@ -87,20 +103,20 @@ export class JiraClient implements TrackerClient {
 
   async fetchCandidateIssues(): Promise<Issue[]> {
     const statesJql = this.config.active_states
-      .map((s) => `"${s}"`)
+      .map((s) => jqlString(s))
       .join(', ');
 
-    let jql = `project = "${this.config.project_key}" AND status IN (${statesJql})`;
+    let jql = `project = ${jqlString(this.config.project_key)} AND status IN (${statesJql})`;
 
     // Handle assignee filter
     const assignee = this.config.assignee?.trim();
     if (assignee === 'me') {
       const accountId = await this.resolveMyAccountId();
       if (accountId) {
-        jql += ` AND assignee = "${accountId}"`;
+        jql += ` AND assignee = ${jqlString(accountId)}`;
       }
     } else if (assignee && assignee !== '') {
-      jql += ` AND assignee = "${assignee}"`;
+      jql += ` AND assignee = ${jqlString(assignee)}`;
     }
 
     jql += ' ORDER BY priority ASC, updated DESC';
@@ -111,7 +127,7 @@ export class JiraClient implements TrackerClient {
   async fetchIssuesByIds(ids: string[]): Promise<Issue[]> {
     if (ids.length === 0) return [];
 
-    const idList = ids.map((id) => `"${id}"`).join(', ');
+    const idList = ids.map((id) => jqlString(id)).join(', ');
     const jql = `id IN (${idList})`;
 
     const issues = await this.searchIssues(jql);
@@ -200,7 +216,7 @@ export class JiraClient implements TrackerClient {
       Authorization: `Basic ${Buffer.from(`${email}:${apiToken}`).toString('base64')}`,
     };
 
-    const response = await fetch(url, {
+    const response = await fetchWithRetry(url, {
       method,
       headers,
       body: body ? JSON.stringify(body) : undefined,
@@ -225,25 +241,25 @@ export class JiraClient implements TrackerClient {
 
   private async searchIssues(jql: string): Promise<Issue[]> {
     const results: Issue[] = [];
-    let startAt = 0;
+    let nextPageToken: string | undefined;
 
     while (true) {
       const params = new URLSearchParams({
         jql,
-        startAt: String(startAt),
         maxResults: String(MAX_RESULTS),
         fields: 'summary,description,priority,status,assignee,labels,created,updated',
       });
+      if (nextPageToken) params.set('nextPageToken', nextPageToken);
 
-      const rawText = await this.request('GET', `/rest/api/3/search?${params.toString()}`);
+      const rawText = await this.request('GET', `/rest/api/3/search/jql?${params.toString()}`);
       const data = JiraSearchResponseSchema.parse(JSON.parse(rawText));
 
       for (const issue of data.issues) {
         results.push(normalizeJiraIssue(issue, this.baseUrl));
       }
 
-      startAt += data.issues.length;
-      if (startAt >= data.total || data.issues.length === 0) break;
+      if (data.isLast || !data.nextPageToken || data.issues.length === 0) break;
+      nextPageToken = data.nextPageToken;
     }
 
     return results;
@@ -296,8 +312,3 @@ function normalizeJiraIssue(data: JiraIssue, baseUrl: string): Issue {
   };
 }
 
-function parseDate(raw: string | null | undefined): Date | null {
-  if (!raw) return null;
-  const d = new Date(raw);
-  return isNaN(d.getTime()) ? null : d;
-}

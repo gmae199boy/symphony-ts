@@ -5,8 +5,9 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync, spawnSync } from 'node:child_process';
 import { logger } from '../logger.js';
+import { issueCtx } from '../utils.js';
+import { spawnAsync } from '../spawn-async.js';
 import type { Issue, WorkspaceRef, WorkspaceBackend } from '../types.js';
 import type { Config } from '../config/schema.js';
 
@@ -62,27 +63,22 @@ export class LocalWorkspaceBackend implements WorkspaceBackend {
     const timeoutMs = this.config.hooks.timeout_ms;
     logger.info(`Running ${hookName} hook for ${issueCtx(issue)}`, { workspace: ref.workspace });
 
-    const result = spawnSync('bash', ['-lc', command], {
+    const result = await spawnAsync('bash', ['-lc', command], {
       cwd: ref.workspace,
-      stdio: 'pipe',
-      timeout: timeoutMs,
-      encoding: 'utf8',
+      timeoutMs,
     });
 
     if (result.status !== 0) {
       const stderr = result.stderr?.trim() ?? '';
-      logger.warn(`${hookName} hook failed for ${issueCtx(issue)}`, {
-        exit: result.status,
-        stderr: stderr.slice(0, 500),
-      });
+      const msg = `${hookName} hook failed for ${issueCtx(issue)} (exit ${result.status}): ${stderr.slice(0, 500)}`;
+      if (hookName === 'before_run' || hookName === 'after_create') {
+        throw new Error(msg);
+      }
+      logger.warn(msg);
     }
   }
 }
 
-function issueDir(issue: Issue): string {
+export function issueDir(issue: Issue): string {
   return issue.identifier.replace(/[^a-zA-Z0-9._-]/g, '_');
-}
-
-function issueCtx(issue: Issue): string {
-  return `issue_id=${issue.id} issue_identifier=${issue.identifier}`;
 }

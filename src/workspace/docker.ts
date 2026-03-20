@@ -12,9 +12,12 @@
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 
 import { logger } from '../logger.js';
+import { issueCtx } from '../utils.js';
+import { shellEscape } from '../shell-utils.js';
+import { spawnAsync } from '../spawn-async.js';
 import type { Issue, WorkspaceRef, WorkspaceBackend } from '../types.js';
 import type { Config } from '../config/schema.js';
 
@@ -27,9 +30,10 @@ const ENV_PASS_THROUGH = [
   'JIRA_API_TOKEN',
   'JIRA_EMAIL',
   'JIRA_HOST',
-  'BITBUCKET_EMAIL',
   'BITBUCKET_API_TOKEN',
   'BITBUCKET_WORKSPACE',
+  'SLACK_BOT_TOKEN',
+  'SLACK_CHANNEL_ID',
 ];
 
 export class DockerWorkspaceBackend implements WorkspaceBackend {
@@ -42,7 +46,7 @@ export class DockerWorkspaceBackend implements WorkspaceBackend {
   async create(issue: Issue, _workerHost?: string): Promise<WorkspaceRef> {
     const name = containerName(issue);
 
-    if (containerExists(name)) {
+    if (await containerExists(name)) {
       logger.info(`Reusing existing container for ${issueCtx(issue)}`, { container: name });
       return { workspace: WORKSPACE_PATH, containerName: name };
     }
@@ -80,7 +84,7 @@ export class DockerWorkspaceBackend implements WorkspaceBackend {
     }
 
     logger.info(`Removing container`, { container: name });
-    const result = spawnSync('docker', ['rm', '-f', name], { encoding: 'utf8', stdio: 'pipe' });
+    const result = await spawnAsync('docker', ['rm', '-f', name], { timeoutMs: 30_000 });
 
     if (result.status !== 0) {
       logger.warn('Failed to remove container', {
@@ -121,7 +125,7 @@ export class DockerWorkspaceBackend implements WorkspaceBackend {
 
     dockerArgs.push(cfg.image, 'sleep', 'infinity');
 
-    const result = spawnSync('docker', dockerArgs, { encoding: 'utf8', stdio: 'pipe' });
+    const result = await spawnAsync('docker', dockerArgs, { timeoutMs: 120_000 });
 
     if (result.status !== 0) {
       const stderr = result.stderr?.trim() ?? '';
@@ -132,6 +136,9 @@ export class DockerWorkspaceBackend implements WorkspaceBackend {
 
     // Inject Claude credentials directly into the container (no file written to host disk).
     await injectClaudeCredentials(name, cfg.auth_mount);
+
+    // Inject git credentials via credential.helper store (no token in git URLs).
+    await injectGitCredentials(name);
 
     // Run after_create hook
     const afterCreate = this.config.hooks.after_create;
@@ -157,35 +164,112 @@ export async function dockerExec(
   command: string,
   timeoutMs: number,
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const result = spawnSync(
-      'docker',
-      ['exec', '--user', 'worker', containerName, 'bash', '-lc', command],
-      { encoding: 'utf8', stdio: 'pipe', timeout: timeoutMs },
-    );
+  const result = await spawnAsync(
+    'docker',
+    ['exec', '--user', 'worker', containerName, 'bash', '-lc', command],
+    { timeoutMs },
+  );
 
-    if (result.status === 0) {
-      resolve();
-    } else if (result.error?.message.includes('ETIMEDOUT') || result.signal === 'SIGTERM') {
-      reject(new Error(`docker exec timed out after ${timeoutMs}ms: ${command}`));
-    } else {
-      const stderr = result.stderr?.trim() ?? '';
-      reject(new Error(`docker exec failed (exit ${result.status}): ${stderr.slice(0, 500)}`));
-    }
-  });
+  if (result.status === 0) {
+    return;
+  } else if (result.timedOut || result.signal === 'SIGTERM') {
+    throw new Error(`docker exec timed out after ${timeoutMs}ms: ${command}`);
+  } else {
+    const stderr = result.stderr?.trim() ?? '';
+    throw new Error(`docker exec failed (exit ${result.status}): ${stderr.slice(0, 500)}`);
+  }
 }
 
-function containerExists(name: string): boolean {
-  const result = spawnSync('docker', ['inspect', '--format', '{{.Name}}', name], {
-    encoding: 'utf8',
-    stdio: 'pipe',
-  });
+export async function containerExists(name: string): Promise<boolean> {
+  const result = await spawnAsync('docker', ['inspect', '--format', '{{.Name}}', name], { timeoutMs: 10_000 });
   return result.status === 0;
 }
 
 function containerName(issue: Issue): string {
+  return containerNameForIssue(issue);
+}
+
+export function containerNameForIssue(issue: Issue): string {
   const safe = issue.identifier.replace(/[^a-zA-Z0-9._-]/g, '_');
   return CONTAINER_PREFIX + safe;
+}
+
+/** List all running symphony containers, returning their names. */
+export async function listSymphonyContainers(): Promise<string[]> {
+  const result = await spawnAsync(
+    'docker',
+    ['ps', '--filter', `name=${CONTAINER_PREFIX}`, '--format', '{{.Names}}'],
+    { timeoutMs: 10_000 },
+  );
+  if (result.status !== 0) return [];
+  return result.stdout.split('\n').map((s) => s.trim()).filter((s) => s !== '');
+}
+
+/** Extract issue identifier from container name (reverse of containerNameForIssue). */
+export function identifierFromContainerName(name: string): string | null {
+  if (!name.startsWith(CONTAINER_PREFIX)) return null;
+  return name.slice(CONTAINER_PREFIX.length);
+}
+
+export async function dockerExecRead(containerName: string, filePath: string): Promise<string | null> {
+  const result = await spawnAsync(
+    'docker', ['exec', '--user', 'worker', containerName, 'cat', filePath],
+    { timeoutMs: 5_000 },
+  );
+  return result.status === 0 ? result.stdout : null;
+}
+
+export async function dockerExecWrite(containerName: string, filePath: string, content: string): Promise<void> {
+  const result = await spawnAsync(
+    'docker', ['exec', '--user', 'worker', '-i', containerName, 'bash', '-c', `cat > ${shellEscape(filePath)}`],
+    { input: content, timeoutMs: 5_000 },
+  );
+  if (result.status !== 0) {
+    throw new Error(`Failed to write ${filePath} in ${containerName}`);
+  }
+}
+
+async function injectGitCredentials(container: string): Promise<void> {
+  const lines: string[] = [];
+
+  // GitHub
+  const ghToken = process.env['GITHUB_TOKEN'];
+  if (ghToken) {
+    lines.push(`https://oauth2:${ghToken}@github.com`);
+  }
+
+  // Bitbucket
+  const bbToken = process.env['BITBUCKET_API_TOKEN'];
+  if (bbToken) {
+    const bbUser = process.env['BITBUCKET_EMAIL'] || 'x-token-auth';
+    lines.push(`https://${encodeURIComponent(bbUser)}:${encodeURIComponent(bbToken)}@bitbucket.org`);
+  }
+
+  if (lines.length === 0) {
+    logger.info('No git credentials found in environment; skipping credential injection', { container });
+    return;
+  }
+
+  const credContent = lines.join('\n') + '\n';
+  const script =
+    'git config --global credential.helper store && ' +
+    'cat > /home/worker/.git-credentials && ' +
+    'chmod 600 /home/worker/.git-credentials';
+
+  const result = await spawnAsync(
+    'docker',
+    ['exec', '--user', 'worker', '-i', container, 'bash', '-c', script],
+    { input: credContent, timeoutMs: 10_000 },
+  );
+
+  if (result.status !== 0) {
+    logger.warn('Failed to inject git credentials into container', {
+      container,
+      stderr: result.stderr?.trim().slice(0, 200),
+    });
+  } else {
+    logger.info('Injected git credentials into container', { container });
+  }
 }
 
 async function injectClaudeCredentials(container: string, configuredAuthMount: string | undefined): Promise<void> {
@@ -196,11 +280,11 @@ async function injectClaudeCredentials(container: string, configuredAuthMount: s
   }
 
   // Write directly into the container via docker exec — nothing touches the host disk.
-  const result = spawnSync(
+  const result = await spawnAsync(
     'docker',
     ['exec', '--user', 'worker', '-i', container, 'bash', '-c',
       'mkdir -p /home/worker/.claude && cat > /home/worker/.claude/.credentials.json && chmod 600 /home/worker/.claude/.credentials.json'],
-    { input: json, encoding: 'utf8', stdio: 'pipe' },
+    { input: json, timeoutMs: 10_000 },
   );
 
   if (result.status !== 0) {
@@ -236,8 +320,4 @@ function readClaudeCredentials(configuredAuthMount: string | undefined): string 
   } catch {
     return null;
   }
-}
-
-function issueCtx(issue: Issue): string {
-  return `issue_id=${issue.id} issue_identifier=${issue.identifier}`;
 }

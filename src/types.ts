@@ -63,7 +63,7 @@ export interface PullRequest {
   url: string;
   branchName: string;
   labels: string[];
-  linearIssueId: string | null;
+  issueIdentifier: string | null;
   state: string; // 'open' | 'closed' | 'merged'
 }
 
@@ -81,15 +81,18 @@ export interface Comment {
   authorLogin: string;
   isBot: boolean;
   createdAt: Date | null;
+  path?: string | null;    // inline 댓글의 파일 경로
+  line?: number | null;    // inline 댓글의 줄 번호
 }
 
-export type RepoEventKind = 'review_approved' | 'changes_requested' | 'new_comment';
+export type RepoEventKind = 'review_approved' | 'changes_requested' | 'new_comments' | 'pr_merged';
 
 export interface RepoEvent {
   kind: RepoEventKind;
   pr: PullRequest;
   review?: Review;
   comment?: Comment;
+  comments?: Comment[];  // new_comments 이벤트용
 }
 
 export type RepoEventHandler = (event: RepoEvent) => void;
@@ -109,6 +112,31 @@ export interface WorkspaceBackend {
   runBeforeRunHook(ref: WorkspaceRef, issue: Issue): Promise<void>;
   runAfterRunHook(ref: WorkspaceRef, issue: Issue): Promise<void>;
   cleanup(ref: WorkspaceRef, issue: Issue): Promise<void>;
+}
+
+/**
+ * Runtime file I/O and workspace queries — abstracts Docker exec, local fs,
+ * and (future) SSH exec behind a single interface.
+ */
+export interface WorkspaceIO {
+  /** Read a file relative to the workspace root. Returns null if not found. */
+  readFile(ref: WorkspaceRef, relativePath: string): Promise<string | null>;
+  /** Write a file relative to the workspace root. Creates parent dirs. */
+  writeFile(ref: WorkspaceRef, relativePath: string, content: string): Promise<void>;
+  /** Get git diff of uncommitted or last commit changes. */
+  getDiff(ref: WorkspaceRef): Promise<string | null>;
+  /** Check if the workspace exists (container running / directory exists). */
+  exists(ref: WorkspaceRef): Promise<boolean>;
+  /** List all managed workspaces. Returns name + issue identifier. */
+  list(): Promise<{ name: string; identifier: string }[]>;
+  /** Extract issue identifier from a workspace name. */
+  identifierFromName(name: string): string | null;
+  /** Derive the workspace name for a given issue. */
+  nameForIssue(issue: Issue): string;
+  /** Build a WorkspaceRef for an issue (without creating the workspace). */
+  refForIssue(issue: Issue): WorkspaceRef;
+  /** Reconstruct a WorkspaceRef from a workspace name (reverse of nameForIssue). */
+  refFromName(name: string): WorkspaceRef;
 }
 
 // ---------------------------------------------------------------------------
@@ -137,4 +165,5 @@ export interface AgentRunOpts {
   workerHost?: string;
   onMessage?: AgentMessageHandler;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }

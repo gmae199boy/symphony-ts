@@ -9,6 +9,8 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { z } from 'zod';
 import { logger } from '../logger.js';
+import { issueCtx } from '../utils.js';
+import { shellEscape } from '../shell-utils.js';
 import type { Issue, AgentBackend, AgentRunOpts, AgentRunResult, AgentMessage } from '../types.js';
 import type { ClaudeAgentConfig } from '../config/schema.js';
 
@@ -98,9 +100,19 @@ function spawnClaude(
     const lines: string[] = [];
     let timedOut = false;
 
+    // Abort signal support — kill child process when signal fires
+    let aborted = false;
+    const onAbort = () => {
+      aborted = true;
+      child.kill('SIGTERM');
+      clearTimeout(timer);
+      reject(new Error('Claude turn aborted'));
+    };
+
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill('SIGTERM');
+      opts.signal?.removeEventListener('abort', onAbort);
       reject(new Error(`Claude turn timed out after ${timeoutMs}ms`));
     }, timeoutMs);
 
@@ -138,9 +150,21 @@ function spawnClaude(
       });
     });
 
+    if (opts.signal) {
+      if (opts.signal.aborted) {
+        aborted = true;
+        child.kill('SIGTERM');
+        clearTimeout(timer);
+        reject(new Error('Claude turn aborted'));
+        return;
+      }
+      opts.signal.addEventListener('abort', onAbort, { once: true });
+    }
+
     child.on('close', (code) => {
       clearTimeout(timer);
-      if (timedOut) return;
+      opts.signal?.removeEventListener('abort', onAbort);
+      if (timedOut || aborted) return;
 
       if (stdoutBuf) { lines.push(stdoutBuf); }
       if (stderrBuf) {
@@ -162,6 +186,7 @@ function spawnClaude(
 
     child.on('error', (err) => {
       clearTimeout(timer);
+      opts.signal?.removeEventListener('abort', onAbort);
       reject(err);
     });
   });
@@ -180,8 +205,11 @@ function buildArgs(
   const args: string[] = [
     '-p', prompt,
     '--output-format', 'json',
-    '--dangerously-skip-permissions',
   ];
+
+  if (opts.containerName) {
+    args.push('--dangerously-skip-permissions');
+  }
 
   if (opts.sessionId) args.push('--continue');
   if (agentConfig.max_turns) args.push('--max-turns', String(agentConfig.max_turns));
@@ -236,16 +264,4 @@ function parseResult(output: string, issue: Issue): AgentRunResult {
   logger.info(`Claude turn complete for ${issueCtx(issue)}`, { sessionId, costUsd: cost });
 
   return { sessionId, cost, tokensTotal };
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function shellEscape(value: string): string {
-  return "'" + value.replace(/'/g, "'\"'\"'") + "'";
-}
-
-function issueCtx(issue: Issue): string {
-  return `issue_identifier=${issue.identifier}`;
 }

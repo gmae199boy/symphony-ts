@@ -9,6 +9,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "docker:build": "docker build -t symphony-worker:latest -f docker/Dockerfile .",
     "dev": "node --env-file=.env --import tsx/esm src/index.ts",
     "start": "node --env-file=.env dist/index.js",
     "test": "vitest run",

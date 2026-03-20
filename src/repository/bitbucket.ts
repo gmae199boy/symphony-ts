@@ -7,6 +7,7 @@
 
 import { z } from 'zod';
 import { logger } from '../logger.js';
+import { fetchWithRetry } from '../fetch-retry.js';
 import { extractIssueIdentifier, isBotLogin, parseDate } from './utils.js';
 import type { PullRequest, Review, Comment } from '../types.js';
 import type { BitbucketRepositoryConfig } from '../config/schema.js';
@@ -53,6 +54,10 @@ const BitbucketCommentSchema = z.object({
   }),
   user: BitbucketUserSchema,
   created_on: z.string().nullable().optional(),
+  inline: z.object({
+    path: z.string().nullable().optional(),
+    to: z.number().nullable().optional(),
+  }).nullable().optional(),
 });
 
 const BitbucketPageSchema = <T extends z.ZodTypeAny>(itemSchema: T) =>
@@ -111,6 +116,45 @@ export class BitbucketClient {
       .map((p, idx) => parseParticipantAsReview(p, idx));
   }
 
+  async fetchPR(prNumber: number): Promise<PullRequest | null> {
+    const path = `/2.0/repositories/${this.config.workspace}/${this.config.repo_slug}/pullrequests/${prNumber}`;
+    try {
+      const rawText = await this.getText(`${BITBUCKET_API}${path}`);
+      const pr = BitbucketPRSchema.parse(JSON.parse(rawText));
+      return parseBitbucketPR(pr);
+    } catch {
+      return null;
+    }
+  }
+
+  async deleteBranch(branchName: string): Promise<void> {
+    const url = `${BITBUCKET_API}/2.0/repositories/${this.config.workspace}/${this.config.repo_slug}/refs/branches/${encodeURIComponent(branchName)}`;
+
+    const headers: Record<string, string> = {};
+    const apiToken = this.config.api_token ?? process.env['BITBUCKET_API_TOKEN'];
+    const email = this.config.email ?? process.env['BITBUCKET_EMAIL'] ?? '';
+
+    if (apiToken) {
+      if (email && email.trim() !== '') {
+        headers['Authorization'] =
+          'Basic ' + Buffer.from(`${email.trim()}:${apiToken}`).toString('base64');
+      } else {
+        headers['Authorization'] = `Bearer ${apiToken}`;
+      }
+    }
+
+    const response = await fetchWithRetry(url, {
+      method: 'DELETE',
+      headers,
+      signal: AbortSignal.timeout(30_000),
+    });
+
+    if (!response.ok && response.status !== 404) {
+      const body = await response.text().catch(() => '');
+      logger.warn(`Bitbucket deleteBranch failed: ${response.status} ${body.slice(0, 300)}`);
+    }
+  }
+
   async fetchPRComments(prNumber: number): Promise<Comment[]> {
     const path = `/2.0/repositories/${this.config.workspace}/${this.config.repo_slug}/pullrequests/${prNumber}/comments`;
     const allComments: BitbucketComment[] = [];
@@ -141,20 +185,31 @@ export class BitbucketClient {
       Accept: 'application/json',
     };
 
-    const email = this.config.email ?? process.env['BITBUCKET_EMAIL'];
     const apiToken = this.config.api_token ?? process.env['BITBUCKET_API_TOKEN'];
+    const email = this.config.email ?? process.env['BITBUCKET_EMAIL'] ?? '';
 
-    if (email && apiToken) {
-      headers['Authorization'] = `Basic ${Buffer.from(`${email}:${apiToken}`).toString('base64')}`;
+    if (apiToken) {
+      // Bitbucket API 토큰(개인)은 Basic(이메일:토큰) 필요. 이메일 없으면 Bearer 시도(워크스페이스 토큰 등).
+      if (email && email.trim() !== '') {
+        headers['Authorization'] =
+          'Basic ' + Buffer.from(`${email.trim()}:${apiToken}`).toString('base64');
+      } else {
+        headers['Authorization'] = `Bearer ${apiToken}`;
+      }
     }
 
-    const response = await fetch(url, {
+    const response = await fetchWithRetry(url, {
       headers,
       signal: AbortSignal.timeout(30_000),
     });
 
     if (!response.ok) {
       const body = await response.text().catch(() => '');
+      if (response.status === 401) {
+        throw new Error(
+          `Bitbucket API 401: BITBUCKET_API_TOKEN(또는 워크스페이스 토큰)과, API 토큰 사용 시 BITBUCKET_EMAIL(Atlassian 계정 이메일)을 확인하세요. 토큰 만료 또는 권한(Repository read, Pull requests 등)을 확인하세요. 원문: ${body.slice(0, 300)}`,
+        );
+      }
       throw new Error(`Bitbucket API ${response.status}: ${body.slice(0, 500)}`);
     }
 
@@ -185,15 +240,15 @@ function parseBitbucketPR(data: BitbucketPR): PullRequest {
     url: data.links.html.href,
     branchName,
     labels: [], // Bitbucket PRs don't have labels
-    linearIssueId: extractIssueIdentifier(branchName, data.description ?? null),
+    issueIdentifier: extractIssueIdentifier(branchName, data.description ?? null),
     state: data.state.toLowerCase(),
   };
 }
 
 function parseParticipantAsReview(data: BitbucketParticipant, index: number): Review {
   const nickname = data.user.nickname ?? data.user.display_name ?? '';
-  // Use a stable numeric ID derived from the participant index
-  const id = index + 1;
+  // Use a stable numeric ID derived from nickname hash (not array index)
+  const id = hashString(nickname || `participant-${index}`);
 
   let state = 'COMMENTED';
   if (data.approved) {
@@ -210,13 +265,23 @@ function parseParticipantAsReview(data: BitbucketParticipant, index: number): Re
   };
 }
 
+function hashString(str: string): number {
+  let hash = 5381;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) + hash + str.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash);
+}
+
 function parseBitbucketComment(data: BitbucketComment): Comment {
   const login = data.user.nickname ?? data.user.display_name ?? '';
   return {
     id: `bb:${data.id}`,
     body: data.content.raw ?? '',
     authorLogin: login,
-    isBot: isBotLogin(login),
+    isBot: isBotLogin(login) || (data.user.type != null && data.user.type !== 'user'),
     createdAt: parseDate(data.created_on ?? null),
+    path: data.inline?.path ?? null,
+    line: data.inline?.to ?? null,
   };
 }

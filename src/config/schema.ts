@@ -6,8 +6,12 @@
  *   trackers:
  *     - kind: linear
  *       project_slug: "my-project"
- *       active_states: [Todo, In Progress]
- *       terminal_states: [Done, Closed]
+ *       active_states:
+ *         - Todo
+ *         - In Progress
+ *       terminal_states:
+ *         - Done
+ *         - Closed
  *       repository:             # optional GitHub / Bitbucket integration
  *         kind: github
  *         repo: owner/repo
@@ -34,7 +38,11 @@ import { z } from 'zod';
 /** Resolve "$ENV_VAR" tokens from the environment. */
 function resolveEnv(value: string): string {
   return value.replace(/\$([A-Z0-9_]+)/g, (_match, name: string) => {
-    return process.env[name] ?? '';
+    const val = process.env[name];
+    if (val === undefined) {
+      console.warn(`[config] Environment variable $${name} is not set (referenced in config)`);
+    }
+    return val ?? '';
   });
 }
 
@@ -67,6 +75,7 @@ const bitbucketRepositorySchema = z.object({
   kind: z.literal('bitbucket'),
   workspace: envString,
   repo_slug: envString,
+  /** Bitbucket API 토큰(개인) 사용 시 필수 — Basic(이메일:토큰) 인증. 워크스페이스 토큰만 쓰면 생략 가능. */
   email: optionalEnvString,
   api_token: optionalEnvString,
   poll_interval_ms: z.number().int().positive().default(30_000),
@@ -198,7 +207,6 @@ const workspaceSchema = z.object({
 
 const workerSchema = z.object({
   ssh_hosts: z.array(z.string()).default([]),
-  max_concurrent_agents: z.number().int().positive().default(10),
 }).default({});
 
 // ---------------------------------------------------------------------------
@@ -208,6 +216,7 @@ const workerSchema = z.object({
 const agentSchema = z.object({
   max_concurrent_agents: z.number().int().positive().default(10),
   retry_backoff_ms: z.number().int().positive().default(5_000),
+  max_retries: z.number().int().min(0).default(2),
 }).default({});
 
 // ---------------------------------------------------------------------------
@@ -253,17 +262,44 @@ const serverSchema = z.object({
 }).default({});
 
 // ---------------------------------------------------------------------------
+// Slack (plan approval workflow)
+// ---------------------------------------------------------------------------
+
+const slackSchema = z.object({
+  bot_token: envString,
+  channel: envString,
+  poll_interval_ms: z.number().int().positive().default(10_000),
+}).optional();
+
+export type SlackConfig = z.infer<typeof slackSchema>;
+
+// ---------------------------------------------------------------------------
+// Self-review (multi-agent code review before PR creation)
+// ---------------------------------------------------------------------------
+
+const reviewSchema = z.object({
+  /** Number of review rounds per agent. */
+  rounds: z.number().int().min(1).max(5).default(2),
+  /** Agent kinds to use for review (run in parallel). */
+  agents: z.array(z.string()).min(1),
+  /** Agent kind used to validate/merge/dedup findings from all agents. */
+  validator: z.string(),
+  /** Agent kind used to execute the approved fixes. */
+  fix_agent: z.string(),
+});
+
+export type ReviewConfig = z.infer<typeof reviewSchema>;
+
+// ---------------------------------------------------------------------------
 // Root config
 // ---------------------------------------------------------------------------
 
 /** Raw YAML-parsed object before normalization. */
 const rawConfigSchema = z.object({
   workspace_backend: z.enum(['local', 'docker']).default('local'),
-  trackers: z.array(trackerSchema).optional(),
-  /** Legacy single-tracker key — normalised to trackers[0] */
-  tracker: trackerSchema.optional(),
+  trackers: z.array(trackerSchema).min(1, 'At least one tracker is required'),
   /** One or more agent backends to run sequentially per issue. */
-  agents: z.array(agentConfigSchema).optional(),
+  agents: z.array(agentConfigSchema).min(1, 'At least one agent is required'),
   workspace: workspaceSchema,
   worker: workerSchema,
   agent: agentSchema,
@@ -271,23 +307,16 @@ const rawConfigSchema = z.object({
   hooks: hooksSchema,
   observability: observabilitySchema,
   server: serverSchema,
+  slack: slackSchema,
+  review: reviewSchema,
 });
 
 /** Fully-parsed, validated config with `trackers` and `agents` always populated. */
 export const configSchema = rawConfigSchema.transform((raw) => {
-  const trackers: TrackerConfig[] = raw.trackers ?? (raw.tracker ? [raw.tracker] : []);
-
-  if (trackers.length === 0) {
-    throw new Error('Config must define at least one tracker (trackers[] or tracker:)');
-  }
-
-  // Default: single Claude agent with all defaults applied
-  const agents: AgentConfig[] = raw.agents ?? [claudeAgentSchema.parse({ kind: 'claude' })];
-
   return {
     workspace_backend: raw.workspace_backend,
-    trackers,
-    agents,
+    trackers: raw.trackers,
+    agents: raw.agents,
     workspace: raw.workspace,
     worker: raw.worker,
     agent: raw.agent,
@@ -295,6 +324,8 @@ export const configSchema = rawConfigSchema.transform((raw) => {
     hooks: raw.hooks,
     observability: raw.observability,
     server: raw.server,
+    slack: raw.slack,
+    review: raw.review,
   };
 });
 

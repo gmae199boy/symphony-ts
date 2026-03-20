@@ -8,6 +8,8 @@
 
 import { z } from 'zod';
 import { logger } from '../logger.js';
+import { fetchWithRetry, sleep } from '../fetch-retry.js';
+import { parseDate } from '../utils.js';
 import type { Issue, BlockerRef, TrackerClient } from '../types.js';
 import type { LinearTrackerConfig } from '../config/schema.js';
 
@@ -179,9 +181,16 @@ const UpdateIssueStateResponseSchema = z.object({
   }),
 });
 
+const GraphQLErrorSchema = z.object({
+  message: z.string().optional(),
+  extensions: z.object({
+    code: z.string().optional(),
+  }).optional(),
+}).passthrough();
+
 const GraphQLEnvelopeSchema = z.object({
   data: z.unknown().optional(),
-  errors: z.array(z.unknown()).optional(),
+  errors: z.array(GraphQLErrorSchema).optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -286,39 +295,56 @@ export class LinearClient implements TrackerClient {
     const apiKey = this.config.api_key;
     if (!apiKey) throw new Error('LINEAR_API_KEY not configured');
 
-    const response = await fetch(this.endpoint, {
-      method: 'POST',
-      headers: {
-        Authorization: apiKey,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ query, variables }),
-      signal: AbortSignal.timeout(30_000),
-    });
+    const maxAttempts = 4; // 1 initial + 3 retries
 
-    const rawText = await response.text();
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const response = await fetchWithRetry(this.endpoint, {
+        method: 'POST',
+        headers: {
+          Authorization: apiKey,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ query, variables }),
+        signal: AbortSignal.timeout(30_000),
+      });
 
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(rawText);
-    } catch {
-      throw new Error(`Linear returned non-JSON response (status ${response.status})`);
+      const rawText = await response.text();
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(rawText);
+      } catch {
+        throw new Error(`Linear returned non-JSON response (status ${response.status})`);
+      }
+
+      const envelope = GraphQLEnvelopeSchema.parse(parsed);
+
+      if (!response.ok) {
+        const preview = rawText.slice(0, MAX_ERROR_LOG_BYTES);
+        logger.error('Linear GraphQL request failed', { status: response.status, preview });
+        throw new Error(`Linear API error: ${response.status}`);
+      }
+
+      // Linear returns 200 with RATELIMITED error code in the body
+      if (envelope.errors?.some((e) => e.extensions?.code === 'RATELIMITED')) {
+        if (attempt < maxAttempts - 1) {
+          const delayMs = 1_000 * Math.pow(2, attempt);
+          logger.warn(`Linear rate limited, retrying in ${delayMs}ms (attempt ${attempt + 1}/3)`);
+          await sleep(delayMs);
+          continue;
+        }
+        // Final attempt — fall through to error handling
+      }
+
+      if (envelope.errors && envelope.errors.length > 0) {
+        logger.error('Linear GraphQL errors', { errors: envelope.errors });
+        throw new Error(`Linear GraphQL errors: ${JSON.stringify(envelope.errors)}`);
+      }
+
+      return envelope.data;
     }
 
-    const envelope = GraphQLEnvelopeSchema.parse(parsed);
-
-    if (!response.ok) {
-      const preview = rawText.slice(0, MAX_ERROR_LOG_BYTES);
-      logger.error('Linear GraphQL request failed', { status: response.status, preview });
-      throw new Error(`Linear API error: ${response.status}`);
-    }
-
-    if (envelope.errors && envelope.errors.length > 0) {
-      logger.error('Linear GraphQL errors', { errors: envelope.errors });
-      throw new Error(`Linear GraphQL errors: ${JSON.stringify(envelope.errors)}`);
-    }
-
-    return envelope.data;
+    throw new Error('Linear: exhausted retries');
   }
 
   // ---------------------------------------------------------------------------
@@ -483,8 +509,3 @@ function extractBlockers(node: IssueNode): BlockerRef[] {
   });
 }
 
-function parseDate(raw: string | null | undefined): Date | null {
-  if (!raw) return null;
-  const d = new Date(raw);
-  return isNaN(d.getTime()) ? null : d;
-}

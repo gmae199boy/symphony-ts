@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
     gh \
     sudo \
+    openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root worker user
