@@ -3,27 +3,12 @@
  */
 
 import { spawn } from 'node:child_process';
-import { z } from 'zod';
 import { logger } from '../logger.js';
 import { shellEscape } from '../shell-utils.js';
 import { buildReviewPrompt, buildValidationPrompt } from './prompt.js';
-import type { ReviewBackend, ReviewContext, ReviewFinding } from './types.js';
+import type { ReviewBackend, ReviewContext } from './types.js';
 import type { WorkspaceRef } from '../types.js';
 import type { ClaudeAgentConfig } from '../config/schema.js';
-
-const FindingsArraySchema = z.array(
-  z.object({
-    file: z.string(),
-    lineStart: z.number(),
-    lineEnd: z.number(),
-    severity: z.enum(['high', 'medium', 'low']),
-    category: z.string(),
-    description: z.string(),
-    suggestedFix: z.string().optional(),
-    agent: z.string().optional(),
-    round: z.number().optional(),
-  }),
-);
 
 export class ClaudeReviewBackend implements ReviewBackend {
   private readonly config: ClaudeAgentConfig;
@@ -34,16 +19,14 @@ export class ClaudeReviewBackend implements ReviewBackend {
     this.ref = ref;
   }
 
-  async review(diff: string, context: ReviewContext): Promise<ReviewFinding[]> {
-    const prompt = buildReviewPrompt(diff, context.previousFindings, context.round, context.totalRounds);
-    const output = await this.runOneShot(prompt);
-    return this.parseFindings(output);
+  async review(diff: string, context: ReviewContext): Promise<string> {
+    const prompt = buildReviewPrompt(diff, context.previousResults, context.round, context.totalRounds);
+    return this.runOneShot(prompt);
   }
 
-  async validate(diff: string, allFindings: ReviewFinding[]): Promise<ReviewFinding[]> {
-    const prompt = buildValidationPrompt(diff, allFindings);
-    const output = await this.runOneShot(prompt);
-    return this.parseFindings(output);
+  async validate(diff: string, allResults: string[]): Promise<string> {
+    const prompt = buildValidationPrompt(diff, allResults);
+    return this.runOneShot(prompt);
   }
 
   private runOneShot(prompt: string): Promise<string> {
@@ -54,7 +37,7 @@ export class ClaudeReviewBackend implements ReviewBackend {
       let spawnArgs: string[];
       let cwd: string;
 
-      const args = ['-p', prompt, '--output-format', 'text'];
+      const args = ['-p', prompt];
 
       if (this.ref.containerName) {
         cmd = 'docker';
@@ -112,34 +95,5 @@ export class ClaudeReviewBackend implements ReviewBackend {
         }
       });
     });
-  }
-
-  private parseFindings(output: string): ReviewFinding[] {
-    // Extract JSON array from output (may be wrapped in markdown code block)
-    const jsonMatch = output.match(/\[[\s\S]*\]/);
-    if (!jsonMatch) {
-      logger.warn('Claude review returned no JSON array', { preview: output.slice(0, 300) });
-      return [];
-    }
-
-    let raw: unknown;
-    try {
-      raw = JSON.parse(jsonMatch[0]);
-    } catch {
-      logger.warn('Claude review returned unparseable JSON', { preview: jsonMatch[0].slice(0, 300) });
-      return [];
-    }
-
-    const result = FindingsArraySchema.safeParse(raw);
-    if (!result.success) {
-      logger.warn('Claude review findings did not match schema', { error: result.error.message });
-      return [];
-    }
-
-    return result.data.map((f) => ({
-      ...f,
-      agent: '',
-      round: 0,
-    }));
   }
 }

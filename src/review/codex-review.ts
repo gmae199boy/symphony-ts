@@ -1,182 +1,99 @@
 /**
- * Codex-based review backend — runs codex app-server RPC in one-shot mode.
+ * Codex-based review backend — runs `codex exec` in one-shot mode.
  */
 
-import { spawn, ChildProcess } from 'node:child_process';
-import { z } from 'zod';
+import { spawn } from 'node:child_process';
 import { logger } from '../logger.js';
+import { shellEscape } from '../shell-utils.js';
 import { buildReviewPrompt, buildValidationPrompt } from './prompt.js';
-import type { ReviewBackend, ReviewContext, ReviewFinding } from './types.js';
+import type { ReviewBackend, ReviewContext } from './types.js';
+import type { WorkspaceRef } from '../types.js';
 import type { CodexAgentConfig } from '../config/schema.js';
-
-// ---------------------------------------------------------------------------
-// JSON-RPC helpers (simplified from agent/codex.ts for one-shot use)
-// ---------------------------------------------------------------------------
-
-const JsonRpcResponseSchema = z.object({
-  jsonrpc: z.literal('2.0'),
-  id: z.union([z.string(), z.number()]),
-  result: z.unknown().optional(),
-  error: z.object({
-    code: z.number(),
-    message: z.string(),
-  }).optional(),
-});
-
-const FindingsArraySchema = z.array(
-  z.object({
-    file: z.string(),
-    lineStart: z.number(),
-    lineEnd: z.number(),
-    severity: z.enum(['high', 'medium', 'low']),
-    category: z.string(),
-    description: z.string(),
-    suggestedFix: z.string().optional(),
-    agent: z.string().optional(),
-    round: z.number().optional(),
-  }),
-);
-
-function rpcCall(
-  child: ChildProcess,
-  id: string | number,
-  method: string,
-  params: unknown,
-  timeoutMs = 60_000,
-): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let buf = '';
-
-    const timer = setTimeout(() => {
-      cleanup();
-      reject(new Error(`RPC call ${method} timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-
-    const onData = (chunk: Buffer) => {
-      buf += chunk.toString('utf8');
-      const lines = buf.split('\n');
-      buf = lines.pop() ?? '';
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-
-        let rawParsed: unknown;
-        try { rawParsed = JSON.parse(trimmed); } catch { continue; }
-
-        const msg = JsonRpcResponseSchema.safeParse(rawParsed);
-        if (!msg.success || msg.data.id !== id) continue;
-
-        cleanup();
-        if (msg.data.error) {
-          reject(new Error(`JSON-RPC error ${msg.data.error.code}: ${msg.data.error.message}`));
-        } else {
-          resolve(msg.data.result);
-        }
-      }
-    };
-
-    const onError = (err: Error) => { cleanup(); reject(err); };
-    const onClose = () => { cleanup(); reject(new Error('Codex process exited before RPC response')); };
-
-    const cleanup = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      child.stdout?.off('data', onData);
-      child.off('error', onError);
-      child.off('close', onClose);
-    };
-
-    child.stdout?.on('data', onData);
-    child.on('error', onError);
-    child.on('close', onClose);
-
-    try {
-      child.stdin?.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
-    } catch (err) {
-      cleanup();
-      reject(err instanceof Error ? err : new Error(String(err)));
-    }
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Backend
-// ---------------------------------------------------------------------------
 
 export class CodexReviewBackend implements ReviewBackend {
   private readonly config: CodexAgentConfig;
-  private readonly workspace: string;
+  private readonly ref: WorkspaceRef;
 
-  constructor(config: CodexAgentConfig, workspace: string) {
+  constructor(config: CodexAgentConfig, ref: WorkspaceRef) {
     this.config = config;
-    this.workspace = workspace;
+    this.ref = ref;
   }
 
-  async review(diff: string, context: ReviewContext): Promise<ReviewFinding[]> {
-    const prompt = buildReviewPrompt(diff, context.previousFindings, context.round, context.totalRounds);
-    const output = await this.runOneShot(prompt);
-    return this.parseFindings(output);
+  async review(diff: string, context: ReviewContext): Promise<string> {
+    const prompt = buildReviewPrompt(diff, context.previousResults, context.round, context.totalRounds);
+    return this.runOneShot(prompt);
   }
 
-  async validate(diff: string, allFindings: ReviewFinding[]): Promise<ReviewFinding[]> {
-    const prompt = buildValidationPrompt(diff, allFindings);
-    const output = await this.runOneShot(prompt);
-    return this.parseFindings(output);
+  async validate(diff: string, allResults: string[]): Promise<string> {
+    const prompt = buildValidationPrompt(diff, allResults);
+    return this.runOneShot(prompt);
   }
 
-  private async runOneShot(prompt: string): Promise<string> {
-    const parts = this.config.command.split(/\s+/);
-    const cmd = parts[0];
-    const cmdArgs = parts.slice(1);
+  private runOneShot(prompt: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const timeoutMs = 3_600_000; // codex config has no turn_timeout_ms; use 1h default
 
-    const child = spawn(cmd, cmdArgs, {
-      cwd: this.workspace,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+      let cmd: string;
+      let spawnArgs: string[];
+      let cwd: string;
 
-    try {
-      const sessionId = `review-${Date.now()}`;
+      const args = ['exec', '--full-auto', prompt];
 
-      await rpcCall(child, sessionId, 'session.start', {
-        workdir: this.workspace,
-        approvalPolicy: this.config.approval_policy,
-        sandboxPolicy: this.config.turn_sandbox_policy,
+      if (this.ref.containerName) {
+        cmd = 'docker';
+        const codexCmd = ['codex', ...args].map(shellEscape).join(' ');
+        const innerCmd = `cd ${shellEscape(this.ref.workspace)} && ${codexCmd}`;
+        spawnArgs = ['exec', '-i', '--user', 'worker', this.ref.containerName, 'bash', '-lc', innerCmd];
+        cwd = process.cwd();
+      } else {
+        cmd = this.config.command || 'codex';
+        spawnArgs = args;
+        cwd = this.ref.workspace;
+      }
+
+      const child = spawn(cmd, spawnArgs, {
+        cwd,
+        stdio: ['ignore', 'pipe', 'pipe'],
       });
 
-      const turnId = `review-turn-${Date.now()}`;
-      const raw = await rpcCall(child, turnId, 'turn.run', { sessionId, prompt });
+      const chunks: string[] = [];
+      let timedOut = false;
 
-      await rpcCall(child, `stop-${sessionId}`, 'session.stop', {}, 5_000).catch(() => undefined);
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill('SIGTERM');
+        reject(new Error(`Codex review timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
 
-      const result = z.object({ result: z.string().optional() }).safeParse(raw);
-      return result.success ? (result.data.result ?? '') : '';
-    } finally {
-      child.kill();
-    }
-  }
+      child.stdout.setEncoding('utf8');
+      child.stderr.setEncoding('utf8');
+      child.stdout.on('data', (chunk: string) => chunks.push(chunk));
+      child.stderr.on('data', (chunk: string) => {
+        if (chunk.trim()) logger.warn(`[codex-review] ${chunk.trim()}`);
+      });
 
-  private parseFindings(output: string): ReviewFinding[] {
-    const jsonMatch = output.match(/\[[\s\S]*\]/);
-    if (!jsonMatch) {
-      logger.warn('Codex review returned no JSON array', { preview: output.slice(0, 300) });
-      return [];
-    }
+      let settled = false;
 
-    let raw: unknown;
-    try { raw = JSON.parse(jsonMatch[0]); } catch {
-      logger.warn('Codex review returned unparseable JSON', { preview: jsonMatch[0].slice(0, 300) });
-      return [];
-    }
+      child.on('error', (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      });
 
-    const result = FindingsArraySchema.safeParse(raw);
-    if (!result.success) {
-      logger.warn('Codex review findings did not match schema', { error: result.error.message });
-      return [];
-    }
+      child.on('close', (code) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (timedOut) return;
 
-    return result.data.map((f) => ({ ...f, agent: '', round: 0 }));
+        const output = chunks.join('');
+        if (code === 0) {
+          resolve(output);
+        } else {
+          reject(new Error(`Codex review exited with code ${code}: ${output.slice(0, 500)}`));
+        }
+      });
+    });
   }
 }

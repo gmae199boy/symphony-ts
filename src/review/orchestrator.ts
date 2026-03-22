@@ -2,16 +2,16 @@
  * ReviewOrchestrator — manages multi-agent, multi-round self-review.
  *
  * Flow:
- *  1. Each agent runs N rounds in series (exclusion list within same agent)
+ *  1. Each agent runs N rounds in series (exclusion via previous results)
  *  2. All agents run in parallel (no cross-agent exclusion)
  *  3. Validation agent merges, deduplicates, removes false positives
- *  4. Severity threshold filter
+ *  4. Returns consolidated review text for Slack
  */
 
 import { logger } from '../logger.js';
 import { ClaudeReviewBackend } from './claude-review.js';
 import { CodexReviewBackend } from './codex-review.js';
-import type { ReviewBackend, ReviewFinding } from './types.js';
+import type { ReviewBackend } from './types.js';
 import type { WorkspaceRef } from '../types.js';
 import type { ReviewConfig, AgentConfig, ClaudeAgentConfig, CodexAgentConfig } from '../config/schema.js';
 
@@ -30,7 +30,7 @@ export class ReviewOrchestrator {
     diff: string,
     reviewConfig: ReviewConfig,
     agentConfigs: AgentConfig[],
-  ): Promise<ReviewFinding[]> {
+  ): Promise<string> {
     logger.info(`Starting self-review: agents=[${reviewConfig.agents.join(', ')}] rounds=${reviewConfig.rounds}`);
 
     // Phase 1: run all agents in parallel, each with serial rounds
@@ -40,16 +40,18 @@ export class ReviewOrchestrator {
       ),
     );
 
-    const merged = perAgentResults.flat();
-    logger.info(`Self-review raw findings: ${merged.length} total`);
+    const allResults = perAgentResults.flat();
+    logger.info(`Self-review raw results: ${allResults.length} round(s)`);
 
-    if (merged.length === 0) return [];
+    if (allResults.length === 0) {
+      return '리뷰 결과 문제가 발견되지 않았습니다.\n\n✅ 리액션이나 피드백을 주세요.';
+    }
 
     // Phase 2: validation agent merges + dedup + false positive filter
-    const validated = await this.validate(diff, merged, reviewConfig.validator, agentConfigs);
-    logger.info(`Self-review after validation: ${validated.length} findings`);
+    const consolidated = await this.validate(diff, allResults, reviewConfig.validator, agentConfigs);
+    logger.info(`Self-review validation complete`);
 
-    return validated;
+    return consolidated;
   }
 
   // -------------------------------------------------------------------------
@@ -61,39 +63,33 @@ export class ReviewOrchestrator {
     diff: string,
     rounds: number,
     agentConfigs: AgentConfig[],
-  ): Promise<ReviewFinding[]> {
+  ): Promise<string[]> {
     const backend = this.createReviewBackend(kind, agentConfigs);
     if (!backend) {
       logger.warn(`No agent config found for review agent kind="${kind}", skipping`);
       return [];
     }
 
-    const findings: ReviewFinding[] = [];
+    const results: string[] = [];
 
     for (let round = 1; round <= rounds; round++) {
       logger.info(`Review ${kind} round ${round}/${rounds}`);
 
       try {
-        const roundFindings = await backend.review(diff, {
-          previousFindings: findings, // same agent's previous rounds only
+        const result = await backend.review(diff, {
+          previousResults: results,
           round,
           totalRounds: rounds,
         });
 
-        for (const f of roundFindings) {
-          f.agent = kind;
-          f.round = round;
-        }
-
-        findings.push(...roundFindings);
-        logger.info(`Review ${kind} round ${round}: found ${roundFindings.length} issues`);
+        results.push(result);
+        logger.info(`Review ${kind} round ${round}: complete`);
       } catch (err) {
         logger.warn(`Review ${kind} round ${round} failed`, { error: String(err) });
-        // Continue to next round — partial results are better than none
       }
     }
 
-    return findings;
+    return results;
   }
 
   // -------------------------------------------------------------------------
@@ -102,27 +98,26 @@ export class ReviewOrchestrator {
 
   private async validate(
     diff: string,
-    allFindings: ReviewFinding[],
+    allResults: string[],
     validatorKind: string,
     agentConfigs: AgentConfig[],
-  ): Promise<ReviewFinding[]> {
+  ): Promise<string> {
     const backend = this.createReviewBackend(validatorKind, agentConfigs);
     if (!backend) {
-      logger.warn(`No agent config for validator kind="${validatorKind}", returning raw findings`);
-      return allFindings;
+      logger.warn(`No agent config for validator kind="${validatorKind}", returning concatenated results`);
+      return allResults.join('\n---\n');
     }
 
-    // ClaudeReviewBackend and CodexReviewBackend both have a validate() method
-    if ('validate' in backend && typeof (backend as Record<string, unknown>).validate === 'function') {
+    if (backend.validate) {
       try {
-        return await (backend as ClaudeReviewBackend | CodexReviewBackend).validate(diff, allFindings);
+        return await backend.validate(diff, allResults);
       } catch (err) {
-        logger.warn('Validation agent failed, returning raw findings', { error: String(err) });
-        return allFindings;
+        logger.warn('Validation agent failed, returning concatenated results', { error: String(err) });
+        return allResults.join('\n---\n');
       }
     }
 
-    return allFindings;
+    return allResults.join('\n---\n');
   }
 
   // -------------------------------------------------------------------------
@@ -137,7 +132,7 @@ export class ReviewOrchestrator {
       case 'claude':
         return new ClaudeReviewBackend(config as ClaudeAgentConfig, this.ref);
       case 'codex':
-        return new CodexReviewBackend(config as CodexAgentConfig, this.ref.workspace);
+        return new CodexReviewBackend(config as CodexAgentConfig, this.ref);
       default:
         return null;
     }

@@ -2,15 +2,13 @@
  * Prompt builders for self-review and validation agents.
  */
 
-import type { ReviewFinding } from './types.js';
-
 // ---------------------------------------------------------------------------
 // Review prompt (per-agent, per-round)
 // ---------------------------------------------------------------------------
 
 export function buildReviewPrompt(
   diff: string,
-  previousFindings: ReviewFinding[],
+  previousResults: string[],
   round: number,
   totalRounds: number,
 ): string {
@@ -18,43 +16,27 @@ export function buildReviewPrompt(
 
   parts.push(`You are a code reviewer. Analyze the following diff and find bugs, dangerous code, edge cases, and potential issues.
 
+Focus ONLY on the changed/added code in the diff. Do not review unchanged code.
+
 <diff>
 ${diff}
 </diff>
 `);
 
-  if (previousFindings.length > 0) {
-    parts.push(`The following issues have already been found in previous rounds. DO NOT repeat these — find NEW issues in DIFFERENT categories:
+  if (previousResults.length > 0) {
+    parts.push(`The following issues have already been found in previous rounds. DO NOT repeat these — find NEW issues in DIFFERENT areas:
 
 <previous_findings>
-${JSON.stringify(previousFindings.map(f => ({
-  file: f.file,
-  lineStart: f.lineStart,
-  lineEnd: f.lineEnd,
-  category: f.category,
-  description: f.description,
-})), null, 2)}
+${previousResults.join('\n---\n')}
 </previous_findings>
 `);
   }
 
   parts.push(`This is round ${round} of ${totalRounds}.
 
-Output ONLY a JSON array of findings. Each finding must have this exact structure:
-[
-  {
-    "file": "relative/path/to/file.ts",
-    "lineStart": 10,
-    "lineEnd": 15,
-    "severity": "high" | "medium" | "low",
-    "category": "string (e.g. race-condition, resource-leak, logic-error, error-handling, security)",
-    "description": "Detailed description of the issue, including the problematic code and why it is a problem.",
-    "suggestedFix": "Optional: suggested code change or approach to fix."
-  }
-]
-
-If no issues are found, output an empty array: []
-Do not include any text outside the JSON array.`);
+Write your review in Korean. Be specific: cite file names and line numbers.
+If no issues are found, explicitly state "리뷰 결과 문제가 발견되지 않았습니다."
+Do not wrap your response in code blocks or JSON.`);
 
   return parts.join('\n');
 }
@@ -65,39 +47,21 @@ Do not include any text outside the JSON array.`);
 
 export function buildValidationPrompt(
   diff: string,
-  allFindings: ReviewFinding[],
+  allResults: string[],
 ): string {
-  return `You are a senior code reviewer validating findings from multiple review agents.
+  return `You are a senior code reviewer. Multiple review rounds produced the following findings. Merge duplicates, remove false positives, and produce a single consolidated review.
 
 <diff>
 ${diff}
 </diff>
 
-<raw_findings>
-${JSON.stringify(allFindings.map(f => ({
-  id: `${f.agent}-R${f.round}-${allFindings.indexOf(f) + 1}`,
-  file: f.file,
-  lineStart: f.lineStart,
-  lineEnd: f.lineEnd,
-  severity: f.severity,
-  category: f.category,
-  description: f.description,
-  suggestedFix: f.suggestedFix,
-  agent: f.agent,
-  round: f.round,
-})), null, 2)}
-</raw_findings>
+<reviews>
+${allResults.map((r, i) => `--- Round ${i + 1} ---\n${r}`).join('\n\n')}
+</reviews>
 
-Your tasks:
-1. **Merge duplicates**: Different agents may describe the same issue differently. Merge them into one finding, noting all agents that found it.
-2. **Remove false positives**: If a finding is not actually a bug (e.g. intentional design, context-dependent), remove it.
-3. **Re-evaluate severity**: Standardize severity across agents.
-4. **Preserve detail**: Keep the most detailed description among merged duplicates.
+Output a single consolidated review in Korean. Be specific: cite file names and line numbers.
+If all findings are false positives, state "리뷰 결과 문제가 발견되지 않았습니다."
+Do not wrap your response in code blocks or JSON.
 
-When merging, set the "agent" field to a comma-separated list (e.g. "claude, codex").
-
-Output ONLY a JSON array with the same structure as the input findings.
-If all findings are false positives, output an empty array: []
-Do not include any text outside the JSON array.`;
+End with: "✅ 리액션이나 피드백을 주세요."`;
 }
-
