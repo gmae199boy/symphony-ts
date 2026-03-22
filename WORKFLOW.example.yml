@@ -1,0 +1,183 @@
+# ============================================================
+# Symphony TS — FULL EXAMPLE
+# 모든 기능을 사용하는 풀 구성 예시
+# 실제 사용 시 이 파일을 WORKFLOW.md의 YAML 블록(--- 사이)에 복사하세요.
+# ============================================================
+
+# ── Workspace backend ────────────────────────────────────────
+# "local" (기본값): workspace.root 아래에 이슈별 디렉토리 생성
+# "docker": 이슈별 Docker 컨테이너를 생성
+workspace_backend: docker
+
+# ── Trackers ─────────────────────────────────────────────────
+# 여러 트래커를 동시에 실행할 수 있습니다 (trackers: 배열).
+# 단일 트래커는 tracker: (단수형)으로도 설정 가능합니다.
+trackers:
+  # ── Linear 트래커 (백엔드 팀 전용, 본인 할당 이슈만) ────────
+  - kind: linear
+    project_slug: "backend-abc123"
+    api_key: $LINEAR_API_KEY
+    assignee: me                # "me" = 현재 Linear 사용자, 또는 Linear user ID
+    poll_interval_ms: 15000     # Linear: 15초마다 이슈 목록 갱신
+    # endpoint: https://api.linear.app/graphql
+    states:
+      planning: Todo
+      plan_review: Plan Review
+      in_progress: In Progress
+      in_review: In Review
+      done: Done
+      canceled: Canceled
+    # active_states / terminal_states 생략 → states에서 자동 유도
+    # 수동 override도 가능:
+    # active_states: [Todo, Plan Review, In Progress]
+    # terminal_states: [Done, Canceled]
+
+    # repository: GitHub / Bitbucket PR 이벤트 통합 (선택)
+    # repository.poll_interval_ms: PR 이벤트 폴링 주기 (이슈 폴링과 독립적)
+    repository:
+      kind: github
+      repo: my-org/backend
+      token: $GITHUB_TOKEN
+      poll_interval_ms: 20000   # GitHub: 20초마다 PR 이벤트 폴링
+      pr_label_filter: symphony # 이 레이블이 있는 PR만 추적
+      event_source: polling     # polling | webhook
+      # webhook_secret: $GITHUB_WEBHOOK_SECRET
+
+      # ── Repository hooks ──────────────────────────────────
+      # 실행 순서:
+      #   컨테이너/디렉토리 생성
+      #     → injectCredentials (Docker만)
+      #     → hooks.after_create     ← clone 전 (credentials 후)
+      #     → auto-clone             ← repository config 기반
+      #     → hooks.after_clone      ← clone 후 (npm ci 등)
+      #     → [에이전트 루프]
+      #       → hooks.before_run
+      #       → agent 실행
+      #       → hooks.after_run
+      #     → hooks.before_remove    ← 워크스페이스 제거 전
+      # repository 없는 tracker → 모든 hooks + auto-clone 스킵.
+      hooks:
+        after_clone: |
+          npm ci --prefer-offline
+        before_run: |
+          git fetch origin && git merge origin/main --no-edit
+        after_run: |
+          rm -rf node_modules/.cache
+        before_remove: |
+          echo "workspace $(pwd) removed at $(date)" >> /var/log/symphony-cleanup.log
+        timeout_ms: 600000
+
+  # ── Jira 트래커 (프론트엔드 팀, 별도 레포) ──────────────────
+  - kind: jira
+    project_key: "FE"
+    host: https://my-org.atlassian.net
+    email: $JIRA_EMAIL
+    api_token: $JIRA_API_TOKEN
+    poll_interval_ms: 60000     # Jira Cloud: rate limit 엄격, 60초 권장
+    states:
+      planning: 아이디어
+      plan_review: 검토 중
+      in_progress: 진행 중
+      in_review: 리뷰 중
+      done: 완료
+      canceled: 취소
+    repository:
+      kind: github
+      repo: my-org/frontend
+      token: $GITHUB_TOKEN
+      poll_interval_ms: 30000   # PR 폴링은 이슈 폴링과 별도로 제어
+      pr_label_filter: symphony
+      event_source: polling
+      hooks:
+        after_clone: |
+          npm ci --prefer-offline
+
+# ── Agents ───────────────────────────────────────────────────
+# 에이전트는 배열 순서대로 순차 실행됩니다.
+# trigger 조건이 없으면 항상 실행됩니다.
+# trigger.issue_labels: 이슈가 해당 레이블 중 하나라도 있어야 실행
+# trigger.pr_labels:    PR-트리거 dispatch 시 PR이 해당 레이블을 가져야 실행
+agents:
+  # ── 1단계: Claude — 모든 이슈에서 메인 구현 담당 ────────────
+  - kind: claude
+    command: claude
+    models:
+      planning: opus             # 계획 수립 시 (new_issue, feedback, pr_feedback)
+      implementation: sonnet     # 구현 시 (approval ✅ 후)
+    max_turns: 30
+    max_budget_usd: 10.0        # 선택: 턴당 지출 한도 (USD)
+    mcp_config: ./mcp.json
+    allowed_tools:              # 비어있으면 모든 툴 허용
+      - Bash
+      - Read
+      - Edit
+      - Write
+    turn_timeout_ms: 7200000    # 2시간
+    # trigger 없음 = 항상 실행
+
+  # ── 2단계: Codex — security 레이블 이슈에 보안 검토 추가 ────
+  - kind: codex
+    command: >
+      codex
+      --config shell_environment_policy.inherit=all
+      --config model_reasoning_effort=xhigh
+      --model gpt-5.3-codex
+      app-server
+    max_turns: 10
+    approval_policy: never
+    thread_sandbox: workspace-write
+    turn_sandbox_policy:
+      type: workspaceWrite
+    trigger:
+      issue_labels:
+        - security
+        - compliance
+
+# ── Workspace ────────────────────────────────────────────────
+workspace:
+  root: /var/symphony/workspaces
+
+# ── Agent concurrency ────────────────────────────────────────
+agent:
+  max_concurrent_agents: 5
+  retry_backoff_ms: 10000
+
+# ── Docker backend (workspace_backend: docker 시 사용) ──────
+docker:
+  image: my-org/symphony-worker:v2.1.0
+  auth_mount: /home/ci/.claude  # 호스트 경로를 컨테이너에 read-only 마운트
+  memory: 8g
+  cpus: "4"
+  env:
+    NPM_TOKEN: $NPM_TOKEN
+    SENTRY_DSN: $SENTRY_DSN
+
+# ── Slack (계획 승인 워크플로우) ──────────────────────────────
+slack:
+  bot_token: $SLACK_BOT_TOKEN
+  channel: $SLACK_CHANNEL_ID
+  poll_interval_ms: 10000
+
+# ── Self-review (코드 리뷰 → 승인 → 수정 → PR) ───────────────
+review:
+  rounds: 2                     # 에이전트당 리뷰 라운드 수
+  agents:
+    - claude
+  validator: claude             # 병합/검증 에이전트
+  fix_agent: claude             # 수정 실행 에이전트
+
+# ── Worker (SSH 원격 실행, 선택) ─────────────────────────────
+worker:
+  ssh_hosts:
+    - deploy@worker-01.internal
+    - deploy@worker-02.internal
+
+# ── Observability ────────────────────────────────────────────
+observability:
+  dashboard: true
+  refresh_interval_ms: 1000
+
+# ── Server ───────────────────────────────────────────────────
+server:
+  port: 4000
+  host: 127.0.0.1

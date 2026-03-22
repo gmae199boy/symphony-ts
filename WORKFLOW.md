@@ -14,52 +14,73 @@ workspace_backend: docker
 # 여러 트래커를 동시에 실행할 수 있습니다 (trackers: 배열).
 # 단일 트래커는 tracker: (단수형)으로도 설정 가능합니다.
 trackers:
-  - kind: jira
-    project_key: "KAN"
-    host: https://bkcnc-crypto.atlassian.net/
-    email: $JIRA_EMAIL
-    api_token: $JIRA_API_TOKEN
-    active_states:
-      - 아이디어
-      - 진행 중
-    terminal_states:
-      - 완료
-    poll_interval_ms: 60000   # Jira는 rate limit이 엄격하므로 더 긴 주기 권장
+  - kind: linear
+    project_slug: "test-7d02b96bde02"
+    api_key: $LINEAR_API_KEY
+    states:
+      planning: Todo
+      plan_review: Plan Review
+      in_progress: In Progress
+      in_review: In Review
+      done: Done
+      canceled: Canceled
+    # active_states / terminal_states 생략 → states에서 자동 유도
+    poll_interval_ms: 30000 # 이슈 폴링 주기 (기본값 30초)
+    # assignee: me              # "me" = 현재 Linear 사용자, 또는 Linear user ID
+    # endpoint: https://api.linear.app/graphql
+
+    # repository: GitHub / Bitbucket PR 이벤트 통합 (선택)
+    # repository.poll_interval_ms: PR 이벤트 폴링 주기 (이슈 폴링과 독립적)
     repository:
-      kind: bitbucket
-      workspace: bkcnc-crypto          # 또는 $BITBUCKET_WORKSPACE
-      repo_slug: test        # 저장소 slug
-      email: $BITBUCKET_EMAIL          # API 토큰 사용 시 필수 (Basic 인증)
-      api_token: $BITBUCKET_API_TOKEN
+      kind: github
+      repo: gmae199boy/symphony
+      token: $GITHUB_TOKEN # 미설정 시 `gh auth token` fallback
       poll_interval_ms: 30000
-      # pr_label_filter: symphony      # 선택: 브랜치 이름에 이 문자열이 있는 PR만 (Bitbucket은 라벨 없음)
-      event_source: polling
+      pr_label_filter: symphony # 이 레이블이 있는 PR만 추적
+      event_source: polling # polling | webhook
+      # webhook_secret: $GITHUB_WEBHOOK_SECRET
+      hooks:
+        after_clone: |
+          cp -r /home/worker/.skills /workspace/.skills
+  # - kind: jira
+  #   project_key: "KAN"
+  #   host: https://bkcnc-crypto.atlassian.net/
+  #   email: $JIRA_EMAIL
+  #   api_token: $JIRA_API_TOKEN
+  #   states:
+  #     planning: 아이디어
+  #     plan_review: 검토 중
+  #     in_progress: 진행 중
+  #     in_review: 리뷰 중
+  #     done: 완료
+  #     canceled: 취소
+  #   poll_interval_ms: 60000   # Jira는 rate limit이 엄격하므로 더 긴 주기 권장
+  #   repository:
+  #     kind: bitbucket
+  #     workspace: bkcnc-crypto          # 또는 $BITBUCKET_WORKSPACE
+  #     repo_slug: test        # 저장소 slug
+  #     email: $BITBUCKET_EMAIL          # API 토큰 사용 시 필수 (Basic 인증)
+  #     api_token: $BITBUCKET_API_TOKEN
+  #     poll_interval_ms: 30000
+  #     # pr_label_filter: symphony      # 선택: 브랜치 이름에 이 문자열이 있는 PR만 (Bitbucket은 라벨 없음)
+  #     event_source: polling
+  #     hooks:
+  #       after_clone: |
+  #         pip install -r requirements.txt
 
 # ── Agents ───────────────────────────────────────────────────
-# 에이전트는 배열 순서대로 순차 실행됩니다.
-# trigger 조건이 없으면 항상 실행됩니다.
-# trigger.issue_labels: 이슈가 해당 레이블 중 하나라도 있어야 실행
-# trigger.pr_labels:    PR-트리거 dispatch 시 PR이 해당 레이블을 가져야 실행
 agents:
   - kind: claude
     # command: claude             # 기본값 "claude"
+    models:
+      planning: opus             # 계획 수립 시 (new_issue, feedback, pr_feedback)
+      implementation: sonnet     # 구현 시 (approval ✅ 후)
     max_turns: 100
     # max_budget_usd: 5.0         # 선택: 턴당 지출 한도 (USD)
     # allowed_tools: []           # 비어있으면 모든 툴 허용
     turn_timeout_ms: 3600000 # 1시간
     # trigger:
     #   issue_labels: [backend]   # 이 레이블이 있는 이슈에만 실행
-
-  # Codex 에이전트 예시 (security 레이블 PR에만 실행)
-  # - kind: codex
-  #   command: codex --config shell_environment_policy.inherit=all app-server
-  #   max_turns: 5
-  #   approval_policy: never
-  #   thread_sandbox: workspace-write
-  #   turn_sandbox_policy:
-  #     type: workspaceWrite
-  #   trigger:
-  #     pr_labels: [security]
 
 # ── Workspace ────────────────────────────────────────────────
 workspace:
@@ -87,172 +108,14 @@ slack:
 
 # ── Self-review (코드 리뷰 → 승인 → 수정 → PR) ───────────────
 review:
-  rounds: 2                    # 에이전트당 리뷰 라운드 수
+  rounds: 2 # 에이전트당 리뷰 라운드 수
   agents:
     - claude
-  validator: claude            # 병합/검증 에이전트
-  fix_agent: claude            # 수정 실행 에이전트
+  validator: claude # 병합/검증 에이전트
+  fix_agent: claude # 수정 실행 에이전트
 
-# ── Hooks ────────────────────────────────────────────────────
-# docker backend: after_create, before_remove는 컨테이너 내부에서 실행
-# local backend: 로컬 workspace 경로에서 실행
-hooks:
-  after_create: |
-    git clone --depth 1 https://bitbucket.org/bkcnc-crypto/test.git . && cp -r /home/worker/.skills /workspace/.skills
-  # before_run: |
-  #   echo "Before agent run"
-  # after_run: |
-  #   echo "After agent run"
-  # before_remove: |
-  #   echo "Cleaning up workspace"
-  # timeout_ms: 300000
 
-# ============================================================
-# FULL EXAMPLE — 모든 기능을 사용하는 풀 구성 예시
-# (실제 사용 시 이 블록 전체를 주석 해제하고 위 설정을 교체)
-# ============================================================
-#
-# workspace_backend: docker
-#
-# trackers:
-#   # ── Linear 트래커 (백엔드 팀 전용, 본인 할당 이슈만) ────────
-#   - kind: linear
-#     project_slug: "backend-abc123"
-#     api_key: $LINEAR_API_KEY
-#     assignee: me
-#     poll_interval_ms: 15000   # Linear: 15초마다 이슈 목록 갱신
-#     active_states:
-#       - Todo
-#       - In Progress
-#       - Merging
-#       - Rework
-#     terminal_states:
-#       - Done
-#       - Closed
-#       - Cancelled
-#       - Duplicate
-#     repository:
-#       kind: github
-#       repo: my-org/backend
-#       token: $GITHUB_TOKEN
-#       poll_interval_ms: 20000  # GitHub: 20초마다 PR 이벤트 폴링
-#       pr_label_filter: symphony
-#       event_source: polling
-#
-#   # ── Jira 트래커 (프론트엔드 팀, 별도 레포) ──────────────────
-#   - kind: jira
-#     project_key: "FE"
-#     host: https://my-org.atlassian.net
-#     email: $JIRA_EMAIL
-#     api_token: $JIRA_API_TOKEN
-#     poll_interval_ms: 60000   # Jira Cloud: rate limit 엄격, 60초 권장
-#     active_states:
-#       - In Progress
-#       - In Review
-#     terminal_states:
-#       - Done
-#       - Closed
-#       - Won't Do
-#     repository:
-#       kind: github
-#       repo: my-org/frontend
-#       token: $GITHUB_TOKEN
-#       poll_interval_ms: 30000  # PR 폴링은 이슈 폴링과 별도로 제어
-#       pr_label_filter: symphony
-#       event_source: polling
-#
-# agents:
-#   # ── 1단계: Claude — 모든 이슈에서 메인 구현 담당 ────────────
-#   - kind: claude
-#     command: claude
-#     max_turns: 30
-#     max_budget_usd: 10.0
-#     mcp_config: ./mcp.json
-#     allowed_tools:
-#       - Bash
-#       - Read
-#       - Edit
-#       - Write
-#     turn_timeout_ms: 7200000   # 2시간
-#     # trigger 없음 = 항상 실행
-#
-#   # ── 2단계: Codex — security 레이블 이슈에 보안 검토 추가 ────
-#   - kind: codex
-#     command: >
-#       codex
-#       --config shell_environment_policy.inherit=all
-#       --config model_reasoning_effort=xhigh
-#       --model gpt-5.3-codex
-#       app-server
-#     max_turns: 10
-#     approval_policy: never
-#     thread_sandbox: workspace-write
-#     turn_sandbox_policy:
-#       type: workspaceWrite
-#     trigger:
-#       issue_labels:
-#         - security
-#         - compliance
-#
-# workspace:
-#   root: /var/symphony/workspaces
-#
-# agent:
-#   max_concurrent_agents: 5
-#   retry_backoff_ms: 10000
-#
-# docker:
-#   image: my-org/symphony-worker:v2.1.0
-#   auth_mount: /home/ci/.claude
-#   memory: 8g
-#   cpus: "4"
-#   env:
-#     NPM_TOKEN: $NPM_TOKEN
-#     SENTRY_DSN: $SENTRY_DSN
-#
-# hooks:
-#   after_create: |
-#     git clone --depth 1 git@github.com:my-org/backend.git .
-#     npm ci --prefer-offline
-#   before_run: |
-#     git fetch origin && git merge origin/main --no-edit
-#   after_run: |
-#     rm -rf node_modules/.cache
-#   before_remove: |
-#     echo "workspace $(pwd) removed at $(date)" >> /var/log/symphony-cleanup.log
-#   timeout_ms: 600000
-#
-# worker:
-#   ssh_hosts:
-#     - deploy@worker-01.internal
-#     - deploy@worker-02.internal
-#   max_concurrent_agents: 3
-#
-# observability:
-#   dashboard: true
-#   refresh_interval_ms: 1000
-#
-# server:
-#   port: 4000
-#   host: 127.0.0.1
-# ============================================================
-
-# ── Worker (SSH 원격 실행, 선택) ─────────────────────────────
-# worker:
-#   ssh_hosts:
-#     - user@host1
-#     - user@host2
-#   max_concurrent_agents: 5
-
-# ── Observability ────────────────────────────────────────────
-# observability:
-#   dashboard: true
-#   refresh_interval_ms: 2000
-
-# ── Server ───────────────────────────────────────────────────
-# server:
-#   port: 4000
-#   host: 0.0.0.0
+# 모든 기능을 사용하는 풀 구성 예시 → WORKFLOW.example.yml 참조
 ---
 
 You are working on a ticket `{{ issue.identifier }}`
@@ -299,10 +162,12 @@ Instructions:
 Work only in the provided repository copy. Do not touch any other path.
 
 {% if tracker_kind == 'linear' %}
+
 ## Prerequisite: Linear access is required
 
 Use curl + GraphQL with `$LINEAR_API_KEY` for all Linear operations (see `.skills/tracker/linear.md`). Only stop if `LINEAR_API_KEY` is unavailable.
 {% elsif tracker_kind == 'jira' %}
+
 ## Prerequisite: Jira access is required
 
 Use curl + REST API with `$JIRA_EMAIL` + `$JIRA_API_TOKEN` for all Jira operations (see `.skills/tracker/jira.md`). Only stop if credentials are unavailable.
@@ -315,11 +180,11 @@ Use curl + REST API with `$JIRA_EMAIL` + `$JIRA_API_TOKEN` for all Jira operatio
 - Spend extra effort up front on planning and verification design before implementation.
 - Reproduce first: always confirm the current behavior/issue signal before changing code so the fix target is explicit.
 - Keep ticket metadata current (state, checklist, acceptance criteria, links).
-- Treat a single persistent Linear comment as the source of truth for progress.
+- Treat a single persistent comment as the source of truth for progress.
 - Use that single workpad comment for all progress and handoff notes; do not post separate "done"/summary comments.
 - Treat any ticket-authored `Validation`, `Test Plan`, or `Testing` section as non-negotiable acceptance input: mirror it in the workpad and execute it before considering the work complete.
 - When meaningful out-of-scope improvements are discovered during execution,
-  file a separate Linear issue instead of expanding scope. The follow-up issue
+  file a separate issue instead of expanding scope. The follow-up issue
   must include a clear title, description, and acceptance criteria, be placed in
   `Backlog`, be assigned to the same project as the current issue, link the
   current issue as `related`, and use `blockedBy` when the follow-up depends on
@@ -339,54 +204,44 @@ Use curl + REST API with `$JIRA_EMAIL` + `$JIRA_API_TOKEN` for all Jira operatio
 - `pull`: keep branch updated with latest `origin/main` before handoff.
 - `land`: (reserved) PR merge is handled by humans; the orchestrator detects the merge and cleans up automatically.
 
-{% if tracker_kind == 'jira' %}
-## Jira status map
+## Status map
 
-- `아이디어` (Ideation) → Write the plan, save it to `/workspace/.symphony/pending_plan.md`, transition to `검토 중`, then exit.
+- `{{ states.planning }}` → Analyze the issue, write an implementation plan, save it to `/workspace/.symphony/pending_plan.md`, transition to `{{ states.plan_review }}`, then exit.
   (The orchestrator reads `pending_plan.md`, sends it to Slack, and watches the thread.)
-- `검토 중` (Plan review, Slack dispatch) → Read `/workspace/.symphony/slack_response.json`.
+  - Special case: if a PR is already attached, treat as feedback/rework loop (run full PR feedback sweep, address or explicitly push back, revalidate, return to `{{ states.in_review }}`).
+- `{{ states.plan_review }}` (Slack dispatch) → Read `/workspace/.symphony/slack_response.json`.
   If it is feedback: revise the plan, save to `pending_plan.md`, and exit.
-  If it is "승인" (approval): write the Agent Workpad, transition to `진행 중`, and start implementation.
-- `진행 중` (In progress) → Implement and commit. Do NOT create a PR — the self-review process handles PR creation after review approval.
-- `리뷰 중` (PR code review, waiting for human) → Exit and wait. The orchestrator monitors for:
-  - **New comments/change requests** → re-dispatched with `pr_feedback.json` → read feedback, write plan to `pending_plan.md`, transition to `검토 중`, exit.
-  - **PR merged** → orchestrator transitions to `완료`, deletes branch, cleans up workspace (no agent action).
-- `완료` (Done) → Terminal state. Do nothing and exit.
-{% elsif tracker_kind == 'linear' %}
-## Linear status map
-
-- `Todo` -> queued; immediately transition to `In Progress` before active work.
-  - Special case: if a PR is already attached, treat as feedback/rework loop (run full PR feedback sweep, address or explicitly push back, revalidate, return to `In Review`).
-- `In Progress` -> Implement and commit. Do NOT create a PR — the self-review process handles PR creation after review approval.
-- `In Review` -> PR is attached and validated; waiting on human approval. Do not code or modify ticket content while in this state.
-- `Done` -> terminal state; no further action required.
-- `Canceled` / `Duplicate` -> terminal state; do nothing and shut down.
-{% endif %}
+  If it is approval: write the Agent Workpad, transition to `{{ states.in_progress }}`, and start implementation.
+- `{{ states.in_progress }}` → Implement and commit. Do NOT create a PR — the self-review process handles PR creation after review approval.
+- `{{ states.in_review }}` (PR code review, waiting for human) → Exit and wait. The orchestrator monitors for:
+  - **New comments/change requests** → re-dispatched with `pr_feedback.json` → read feedback, write plan to `pending_plan.md`, transition to `{{ states.plan_review }}`, exit.
+  - **PR merged** → orchestrator transitions to `{{ states.done }}`, deletes branch, cleans up workspace (no agent action).
+- `{{ states.done }}`{% if states.canceled %} / `{{ states.canceled }}`{% endif %} → Terminal state. Do nothing and exit.
 
 ## Slack plan approval protocol
 
-When the issue state is `아이디어` (Ideation), follow the protocol below.
+When the issue state is `{{ states.planning }}`, follow the protocol below.
 
 **Important: The agent does not call the Slack API directly.** All Slack I/O is handled by the orchestrator.
 
-### Ideation → Send plan
+### Planning → Send plan
 
 1. Analyze the issue and write an implementation plan.
 2. Save the plan to `/workspace/.symphony/pending_plan.md` (markdown format).
-3. Transition the issue state to `검토 중`.
+3. Transition the issue state to `{{ states.plan_review }}`.
 4. Exit.
    - The orchestrator reads `pending_plan.md`, sends it to the Slack channel, and watches the thread.
    - After sending, `pending_plan.md` is cleared automatically.
 
-### Under review → Handle Slack response (re-dispatch)
+### Plan review → Handle Slack response (re-dispatch)
 
 When the orchestrator detects a Slack response, it writes the response to `/workspace/.symphony/slack_response.json` and re-dispatches the agent (resuming the existing session via `--continue`).
 
 1. Read `/workspace/.symphony/slack_response.json`.
-2. If the response text contains "승인" (approval):
-   - Write the Agent Workpad in Jira.
-   - Transition the issue state to `진행 중`.
-   - Start implementation (Step 1/2 flow).
+2. If the response is approval:
+   - Write the Agent Workpad.
+   - Transition the issue state to `{{ states.in_progress }}`.
+   - Start implementation.
 3. Otherwise (feedback):
    - Revise the plan according to the feedback.
    - Save the revised plan to `/workspace/.symphony/pending_plan.md`.
@@ -402,7 +257,7 @@ When PR feedback arrives, the orchestrator writes feedback to `/workspace/.symph
 2. Analyze each comment and identify required code changes.
 3. Write an implementation plan addressing each feedback item.
 4. Save the plan to `/workspace/.symphony/pending_plan.md`.
-5. Transition the issue state to `검토 중`.
+5. Transition the issue state to `{{ states.plan_review }}`.
 6. Exit.
    - The orchestrator sends the plan to Slack for approval (same flow as initial plan).
 
@@ -426,6 +281,8 @@ During implementation, if you encounter a decision that requires human judgement
 
 After the agent completes implementation and commits, the orchestrator automatically runs a multi-agent self-review process. The agent does **not** call the review directly — the orchestrator handles it.
 
+The orchestrator sends the review results to Slack **regardless of whether issues were found**. The user must approve or provide feedback before the agent proceeds.
+
 ### Review results → Handle Slack response (re-dispatch)
 
 When the orchestrator sends review results to Slack and receives a user response, it writes the response to `/workspace/.symphony/slack_response.json` and re-dispatches the agent.
@@ -433,38 +290,48 @@ When the orchestrator sends review results to Slack and receives a user response
 1. Check if `/workspace/.symphony/pending_review.md` exists.
 2. If it exists, read `/workspace/.symphony/slack_response.json`:
    - If the response is approval (✅ reaction or approval text):
-     1. Read `/workspace/.symphony/review_findings.json`.
-     2. Build a concrete fix plan based on the review findings.
-     3. Write the plan to `/workspace/.symphony/pending_plan.md`.
-     4. Delete `/workspace/.symphony/pending_review.md`.
-     5. Delete `/workspace/.symphony/slack_response.json`.
-     6. Exit (the orchestrator sends the plan to Slack for approval).
+     1. Read `/workspace/.symphony/pending_review.md` for review context.
+     2. If the review contains issues: build a concrete fix plan based on the findings.
+     3. If no issues: proceed to create PR directly.
+     4. Write the plan to `/workspace/.symphony/pending_plan.md` (if fixes needed).
+     5. Delete `/workspace/.symphony/pending_review.md`.
+     6. Delete `/workspace/.symphony/slack_response.json`.
+     7. Exit (the orchestrator sends the plan to Slack for approval, or if no fixes needed, agent creates PR on next dispatch).
    - If the response is feedback:
-     1. Revise the review findings based on the user's feedback.
-     2. Update `/workspace/.symphony/review_findings.json` with revised data.
-     3. Rewrite `/workspace/.symphony/pending_review.md` with the revised review.
-     4. Delete `/workspace/.symphony/slack_response.json`.
-     5. Exit (the orchestrator re-sends the revised review to Slack).
+     1. Revise the review based on the user's feedback.
+     2. Rewrite `/workspace/.symphony/pending_review.md` with the revised review.
+     3. Delete `/workspace/.symphony/slack_response.json`.
+     4. Exit (the orchestrator re-sends the revised review to Slack).
 
 ### Fix plan approved → Execute fixes and create PR (re-dispatch)
 
 When the fix plan is approved via Slack, the orchestrator re-dispatches the agent.
 
-1. Check if `/workspace/.symphony/review_findings.json` exists AND `/workspace/.symphony/pending_plan.md` does NOT exist AND `/workspace/.symphony/slack_response.json` contains approval.
-2. Execute all fixes described in the approved plan.
-3. Commit all changes.
-4. Push the branch and create a PR.
-{% if repository_kind == 'github' %}
+1. Execute all fixes described in the approved plan.
+2. Commit all changes.
+3. Push the branch and create a PR.
+   {% if repository_kind == 'github' %}
    - Ensure the GitHub PR has label `symphony` (add it if missing).
-{% endif %}
+     {% endif %}
    - PR title format: `{{ issue.identifier }}: <short description in English>`.
+4. Reply to each PR comment explaining the resolution (if applicable).
 5. Attach PR URL to the issue.
-6. Delete `/workspace/.symphony/review_findings.json`.
-7. Delete `/workspace/.symphony/slack_response.json`.
-8. Move issue to {% if tracker_kind == 'jira' %}`리뷰 중`{% else %}`In Review`{% endif %}.
+6. Delete `/workspace/.symphony/slack_response.json`.
+7. Move issue to `{{ states.in_review }}`.
+
+### No fixes needed → Create PR directly (re-dispatch)
+
+When the review found no issues and the user approved:
+
+1. Push the branch and create a PR.
+   {% if repository_kind == 'github' %}
+   - Ensure the GitHub PR has label `symphony` (add it if missing).
+     {% endif %}
+   - PR title format: `{{ issue.identifier }}: <short description in English>`.
+2. Attach PR URL to the issue.
+3. Move issue to `{{ states.in_review }}`.
 
 **Do not** write `pending_review.md` manually — the orchestrator generates it from the review process.
-**Do not** write `review_findings.json` manually — the orchestrator generates it from the review process.
 
 ### slack_response.json format
 
@@ -482,7 +349,19 @@ Read **all** entries and consider them together. After processing, the orchestra
 ### pr_feedback.json format
 
 ```json
-{ "comments": [{ "id": "", "body": "", "author": "", "path": null, "line": null, "created_at": "" }], "received_at": "" }
+{
+  "comments": [
+    {
+      "id": "",
+      "body": "",
+      "author": "",
+      "path": null,
+      "line": null,
+      "created_at": ""
+    }
+  ],
+  "received_at": ""
+}
 ```
 
 ## Step 0: Determine current ticket state and route
@@ -490,19 +369,11 @@ Read **all** entries and consider them together. After processing, the orchestra
 1. Fetch the issue by explicit ticket ID.
 2. Read the current state.
 3. Route to the matching flow:
-{% if tracker_kind == 'jira' %}
-   - `아이디어` -> write plan, save to `pending_plan.md`, transition `검토 중`, exit.
-   - `검토 중` -> read `slack_response.json`, handle approval or feedback.
-   - `진행 중` -> if `pending_review.md` + `slack_response.json` exist: handle review feedback (self-review protocol). If `review_findings.json` + `slack_response.json` exist (no `pending_plan.md`, no `pending_review.md`): execute fixes and create PR. Otherwise: continue execution flow from current scratchpad comment.
-   - `리뷰 중` -> if `pr_feedback.json` exists: read feedback, write plan, transition `검토 중`, exit. Otherwise: exit and wait.
-   - `완료` -> do nothing and shut down.
-{% elsif tracker_kind == 'linear' %}
-   - `Todo` -> immediately move to `In Progress`, then ensure bootstrap workpad comment exists (create if missing), then start execution flow.
-     - If PR is already attached, start by reviewing all open PR comments and deciding required changes vs explicit pushback responses.
-   - `In Progress` -> if `pending_review.md` + `slack_response.json` exist: handle review feedback (self-review protocol). If `review_findings.json` + `slack_response.json` exist (no `pending_plan.md`, no `pending_review.md`): execute fixes and create PR. Otherwise: continue execution flow from current scratchpad comment.
-   - `In Review` -> if `pr_feedback.json` exists: read feedback, write plan, transition to plan review state, exit. Otherwise: exit and wait.
-   - `Done` / `Canceled` / `Duplicate` -> do nothing and shut down.
-{% endif %}
+   - `{{ states.planning }}` → write plan, save to `pending_plan.md`, transition `{{ states.plan_review }}`, exit.
+   - `{{ states.plan_review }}` → read `slack_response.json`, handle approval or feedback.
+   - `{{ states.in_progress }}` → if `pending_review.md` + `slack_response.json` exist: handle review feedback (self-review protocol). Otherwise: continue execution flow from current scratchpad comment.
+   - `{{ states.in_review }}` → if `pr_feedback.json` exists: read feedback, write plan to `pending_plan.md`, transition `{{ states.plan_review }}`, exit. Otherwise: exit and wait.
+   - `{{ states.done }}`{% if states.canceled %} / `{{ states.canceled }}`{% endif %} → do nothing and shut down.
 4. Check whether a PR already exists for the current branch and whether it is closed.
    - If a branch PR exists and is `CLOSED` or `MERGED`, treat prior branch work as non-reusable for this run.
    - Create a fresh branch from `origin/main` and restart execution flow as a new attempt.
@@ -553,14 +424,14 @@ When a ticket has an attached PR, run this protocol before moving to {% if track
 
 1. Identify the PR number from issue links/attachments.
 2. Gather feedback from all channels:
-{% if repository_kind == 'github' %}
+   {% if repository_kind == 'github' %}
    - Top-level PR comments (`gh pr view --comments`).
    - Inline review comments (`gh api repos/<owner>/<repo>/pulls/<pr>/comments`).
    - Review summaries/states (`gh pr view --json reviews`).
-{% elsif repository_kind == 'bitbucket' %}
+     {% elsif repository_kind == 'bitbucket' %}
    - Read `/workspace/.symphony/pr_feedback.json` for the latest PR comments.
    - Use Bitbucket REST API for additional PR operations (see `.skills/repo/bitbucket.md`).
-{% endif %}
+     {% endif %}
 3. Treat every actionable reviewer comment (human or bot), including inline review comments, as blocking until one of these is true:
    - code/test/docs updated to address it, or
    - explicit, justified pushback reply is posted on that thread.
@@ -581,11 +452,17 @@ Use this only when completion is blocked by missing required tools or missing au
 - Keep the brief concise and action-oriented; do not add extra top-level comments outside the workpad.
 
 {% if tracker_kind == 'jira' %}
+
 ## Step 2: Execution phase (아이디어 → 진행 중 → 리뷰 중)
+
 {% elsif tracker_kind == 'linear' %}
+
 ## Step 2: Execution phase (Todo → In Progress → In Review)
+
 {% else %}
+
 ## Step 2: Execution phase
+
 {% endif %}
 
 1.  Determine current repo state (`branch`, `git status`, `HEAD`) and verify the kickoff `pull` sync result is already recorded in the workpad before implementation continues.
@@ -667,7 +544,7 @@ PR approval and merge are performed by humans. The agent does **not** merge PRs.
 - Validation/tests are green for the latest commit.
 - PR feedback sweep is complete and no actionable comments remain.
 - PR checks are green, branch is pushed, and PR is linked on the issue.
-{% if repository_kind == 'github' %}- Required PR metadata is present (`symphony` label).{% endif %}
+  {% if repository_kind == 'github' %}- Required PR metadata is present (`symphony` label).{% endif %}
 - If app-touching, runtime validation/media requirements from `App runtime validation (required)` are complete.
 
 ## Guardrails
@@ -681,11 +558,11 @@ PR approval and merge are performed by humans. The agent does **not** merge PRs.
 - If out-of-scope improvements are found, create a separate issue rather than expanding current scope, and include a clear title/description/acceptance criteria, same-project assignment, and a `related` link to the current issue.
 - Do not move to {% if tracker_kind == 'jira' %}`리뷰 중`{% else %}`In Review`{% endif %} unless the completion bar is satisfied.
 - In {% if tracker_kind == 'jira' %}`리뷰 중`{% else %}`In Review`{% endif %}, do not make changes; wait and poll.
-{% if tracker_kind == 'jira' %}
+  {% if tracker_kind == 'jira' %}
 - If state is terminal (`완료`), do nothing and shut down.
-{% else %}
+  {% else %}
 - If state is terminal (`Done`, `Canceled`, `Duplicate`), do nothing and shut down.
-{% endif %}
+  {% endif %}
 - Keep issue text concise, specific, and reviewer-oriented.
 - If blocked and no workpad exists yet, add one blocker comment describing blocker, impact, and next unblock action.
 
@@ -718,11 +595,11 @@ Use this exact structure for the persistent workpad comment and keep it updated 
 
 ### Notes
 
-- `YYYY-MM-DD HH:mm:ss` <작업 내용> — [`<short-sha>`](<commit-url>)
+- `YYYY-MM-DD HH:mm:ss` <작업 내용> — [`<short-sha>`](commit-url)
 
 ### PR Feedback
 
-- [ ] [댓글](<pr-comment-url>): <요약> → [`<short-sha>`](<commit-url>) | [답글](<pr-reply-url>)
+- [ ] [댓글](pr-comment-url): <요약> → [`<short-sha>`](commit-url) | [답글](pr-reply-url)
 
 ### Confusions
 
