@@ -6,20 +6,17 @@
  *  - Select candidate worker hosts (SSH or local)
  *  - Create workspace via WorkspaceBackend
  *  - Run before/after hooks
- *  - Drive multi-turn agent loop (Claude or Codex), sequentially per AgentConfig
- *  - Resume Claude session via --continue across turns
+ *  - Drive multi-turn agent loop (unified for Claude/Codex)
  *  - Check issue state after each turn to decide continue/done
  */
 
 import { logger } from './logger.js';
 import { issueCtx } from './utils.js';
-import { buildPrompt, buildContinuationPrompt, type PromptExtras } from './prompt-builder.js';
-import { ClaudeBackend } from './agent/claude.js';
-import { CodexBackend } from './agent/codex.js';
-import { LocalWorkspaceBackend } from './workspace/local.js';
-import { DockerWorkspaceBackend, dockerExecRead } from './workspace/docker.js';
-import type { Issue, AgentBackend, WorkspaceBackend, WorkspaceRef, AgentMessageHandler, TrackerClient } from './types.js';
-import type { Config, AgentConfig, ClaudeAgentConfig, CodexAgentConfig } from './config/schema.js';
+import { buildPrompt, buildResumePrompt, type PromptExtras } from './prompt-builder.js';
+import { createAgentBackend } from './agent/factory.js';
+import { createWorkspaceBackend } from './workspace/io.js';
+import type { Issue, AgentBackend, WorkspaceBackend, WorkspaceRef, WorkspaceIO, AgentMessageHandler, TrackerClient, DispatchReason } from './types.js';
+import type { Config, AgentConfig, RepositoryConfig, StatesConfig } from './config/schema.js';
 
 export interface RunOptions {
   workerHost?: string;
@@ -38,6 +35,16 @@ export interface RunOptions {
   signal?: AbortSignal;
   /** Active states for the specific tracker dispatching this issue. */
   activeStates?: string[];
+  /** Why this run was dispatched */
+  reason?: DispatchReason;
+  /** WorkspaceIO for file access (pending_plan/question detection) */
+  io?: WorkspaceIO;
+  /** Repository config for auto-clone */
+  repository?: RepositoryConfig;
+  /** Semantic state mapping for prompt template */
+  states?: StatesConfig;
+  /** Model override for this run (e.g. 'opus', 'sonnet') */
+  model?: string;
 }
 
 export interface RuntimeInfo {
@@ -106,7 +113,7 @@ async function runOnWorkerHost(
     `Starting worker attempt for ${issueCtx(issue)} worker_host=${workerHost ?? 'local'}`,
   );
 
-  const workspaceBackend = createWorkspaceBackend(config);
+  const workspaceBackend = createWorkspaceBackend(config, opts.repository);
   const ref = await workspaceBackend.create(issue, workerHost ?? undefined);
 
   opts.onRuntimeInfo?.({
@@ -145,153 +152,92 @@ async function runAgentSequence(
       `Running ${agentConfig.kind} agent for ${issueCtx(issue)}`,
     );
 
-    if (agentConfig.kind === 'claude') {
-      const backend = new ClaudeBackend(agentConfig);
-      await runClaudeTurns(issue, backend, agentConfig, config, promptTemplate, ref, opts, issueStateFetcher);
-    } else {
-      const backend = new CodexBackend(agentConfig);
-      await runCodexTurns(issue, backend, agentConfig, config, promptTemplate, ref, opts, issueStateFetcher, 1);
+    const backend = createAgentBackend(agentConfig);
+    try {
+      await runAgentTurns(issue, backend, agentConfig, config, promptTemplate, ref, opts, issueStateFetcher);
+    } finally {
+      await backend.dispose?.();
     }
   }
 }
 
 // ---------------------------------------------------------------------------
-// Claude multi-turn loop (with session persistence)
+// Unified multi-turn loop
 // ---------------------------------------------------------------------------
 
-async function runClaudeTurns(
+async function runAgentTurns(
   issue: Issue,
   agentBackend: AgentBackend,
-  agentConfig: ClaudeAgentConfig,
+  agentConfig: AgentConfig,
   config: Config,
   promptTemplate: string,
   ref: WorkspaceRef,
   opts: RunOptions,
   issueStateFetcher: (ids: string[]) => Promise<Issue[]>,
-): Promise<void> {
-  await doRunClaudeTurns(
-    issue, agentBackend, agentConfig, config, promptTemplate, ref, opts,
-    issueStateFetcher, 1, agentConfig.max_turns,
-  );
-}
-
-async function doRunClaudeTurns(
-  issue: Issue,
-  agentBackend: AgentBackend,
-  agentConfig: ClaudeAgentConfig,
-  config: Config,
-  promptTemplate: string,
-  ref: WorkspaceRef,
-  opts: RunOptions,
-  issueStateFetcher: (ids: string[]) => Promise<Issue[]>,
-  turnNumber: number,
-  maxTurns: number,
-): Promise<void> {
-  const prompt = turnNumber === 1
-    ? await buildPrompt(promptTemplate, issue, turnNumber, {
-        trackerKind: opts.trackerKind,
-        repositoryKind: opts.repositoryKind,
-      })
-    : buildContinuationPrompt(turnNumber, maxTurns, opts.trackerKind);
-
-  // Turn 2+: use --continue to resume the most recent conversation in the workspace.
-  // Turn 1: always fresh start — event re-dispatches get full WORKFLOW prompt.
-  const sessionId = turnNumber > 1 ? 'continue' : null;
-
-  if (opts.signal?.aborted) throw new Error('Agent run aborted');
-
-  const result = await agentBackend.run(ref.workspace, prompt, issue, {
-    sessionId,
-    containerName: ref.containerName,
-    workerHost: ref.workerHost,
-    onMessage: opts.onMessage,
-    timeoutMs: agentConfig.turn_timeout_ms,
-    signal: opts.signal,
-  });
-
-  logger.info(
-    `Completed Claude turn for ${issueCtx(issue)} session_id=${result.sessionId ?? 'null'} workspace=${ref.workspace} turn=${turnNumber}/${maxTurns}`,
-  );
-
-  opts.onTurnComplete?.({ cost: result.cost, tokensTotal: result.tokensTotal });
-
-  const perTrackerActive = opts.activeStates ?? config.trackers.flatMap((t) => t.active_states);
-  const { action, refreshedIssue } = await checkContinue(issue, issueStateFetcher, perTrackerActive);
-
-  // pending_plan.md 또는 question.md가 존재하면 Slack 응답 대기 — 턴 루프 강제 중단
-  if (action === 'continue' && ref.containerName) {
-    if (await hasPendingPlan(ref.containerName)) {
-      logger.info(`Pending plan detected for ${issueCtx(refreshedIssue)}; pausing turn loop for Slack approval`);
-      return;
-    }
-    if (await hasQuestion(ref.containerName)) {
-      logger.info(`Question detected for ${issueCtx(refreshedIssue)}; pausing turn loop for Slack answer`);
-      return;
-    }
-  }
-
-  if (action === 'continue' && turnNumber < maxTurns) {
-    logger.info(`Continuing Claude run for ${issueCtx(refreshedIssue)} turn=${turnNumber}/${maxTurns}`);
-    await doRunClaudeTurns(
-      refreshedIssue, agentBackend, agentConfig, config, promptTemplate, ref, opts,
-      issueStateFetcher, turnNumber + 1, maxTurns,
-    );
-  } else if (action === 'continue') {
-    logger.info(`Reached max_turns for ${issueCtx(refreshedIssue)} with issue still active; returning control to orchestrator`);
-  }
-  // action === 'done' → just return
-}
-
-// ---------------------------------------------------------------------------
-// Codex multi-turn loop
-// ---------------------------------------------------------------------------
-
-async function runCodexTurns(
-  issue: Issue,
-  agentBackend: AgentBackend,
-  agentConfig: CodexAgentConfig,
-  config: Config,
-  promptTemplate: string,
-  ref: WorkspaceRef,
-  opts: RunOptions,
-  issueStateFetcher: (ids: string[]) => Promise<Issue[]>,
-  turnNumber: number,
 ): Promise<void> {
   const maxTurns = agentConfig.max_turns;
+  const reason = opts.reason;
+  let currentIssue = issue;
 
-  const prompt = turnNumber === 1
-    ? await buildPrompt(promptTemplate, issue, turnNumber, {
+  for (let turnNumber = 1; turnNumber <= maxTurns; turnNumber++) {
+    // Build prompt — two branches:
+    //   1. New issue on turn 1 → full prompt
+    //   2. Everything else (re-dispatch or continuation) → resume prompt
+    let prompt: string;
+
+    if (turnNumber === 1 && (reason === 'new_issue' || reason == null)) {
+      prompt = await buildPrompt(promptTemplate, currentIssue, turnNumber, {
         trackerKind: opts.trackerKind,
         repositoryKind: opts.repositoryKind,
-      })
-    : buildContinuationPrompt(turnNumber, maxTurns, opts.trackerKind);
+        states: opts.states,
+      });
+    } else {
+      prompt = buildResumePrompt(reason, turnNumber, maxTurns, opts.trackerKind);
+    }
 
-  if (opts.signal?.aborted) throw new Error('Agent run aborted');
+    if (opts.signal?.aborted) throw new Error('Agent run aborted');
 
-  const result = await agentBackend.run(ref.workspace, prompt, issue, {
-    containerName: ref.containerName,
-    workerHost: ref.workerHost,
-    onMessage: opts.onMessage,
-    signal: opts.signal,
-  });
+    const turnTimeoutMs = 'turn_timeout_ms' in agentConfig ? agentConfig.turn_timeout_ms : undefined;
 
-  logger.info(
-    `Completed Codex turn for ${issueCtx(issue)} session_id=${result.sessionId ?? 'null'} workspace=${ref.workspace} turn=${turnNumber}/${maxTurns}`,
-  );
+    const result = await agentBackend.run(ref.workspace, prompt, currentIssue, {
+      containerName: ref.containerName,
+      workerHost: ref.workerHost,
+      onMessage: opts.onMessage,
+      timeoutMs: turnTimeoutMs,
+      signal: opts.signal,
+      model: opts.model,
+    });
 
-  opts.onTurnComplete?.({ cost: result.cost, tokensTotal: result.tokensTotal });
-
-  const perTrackerActive = opts.activeStates ?? config.trackers.flatMap((t) => t.active_states);
-  const { action, refreshedIssue } = await checkContinue(issue, issueStateFetcher, perTrackerActive);
-
-  if (action === 'continue' && turnNumber < maxTurns) {
-    logger.info(`Continuing Codex run for ${issueCtx(refreshedIssue)} turn=${turnNumber}/${maxTurns}`);
-    await runCodexTurns(
-      refreshedIssue, agentBackend, agentConfig, config, promptTemplate, ref, opts,
-      issueStateFetcher, turnNumber + 1,
+    logger.info(
+      `Completed ${agentConfig.kind} turn for ${issueCtx(currentIssue)} workspace=${ref.workspace} turn=${turnNumber}/${maxTurns}`,
     );
-  } else if (action === 'continue') {
-    logger.info(`Reached max_turns for ${issueCtx(refreshedIssue)} with issue still active; returning control to orchestrator`);
+
+    opts.onTurnComplete?.({ cost: result.cost, tokensTotal: result.tokensTotal });
+
+    const perTrackerActive = opts.activeStates ?? config.trackers.flatMap((t) => t.active_states);
+    const { action, refreshedIssue } = await checkContinue(currentIssue, issueStateFetcher, perTrackerActive);
+    currentIssue = refreshedIssue;
+
+    // pending_plan.md 또는 question.md가 존재하면 Slack 응답 대기 — 턴 루프 강제 중단
+    if (action === 'continue' && opts.io) {
+      if (await hasPendingPlan(opts.io, ref)) {
+        logger.info(`Pending plan detected for ${issueCtx(refreshedIssue)}; pausing turn loop for Slack approval`);
+        return;
+      }
+      if (await hasQuestion(opts.io, ref)) {
+        logger.info(`Question detected for ${issueCtx(refreshedIssue)}; pausing turn loop for Slack answer`);
+        return;
+      }
+    }
+
+    if (action !== 'continue' || turnNumber >= maxTurns) {
+      if (action === 'continue') {
+        logger.info(`Reached max_turns for ${issueCtx(refreshedIssue)} with issue still active; returning control to orchestrator`);
+      }
+      return;
+    }
+
+    logger.info(`Continuing ${agentConfig.kind} run for ${issueCtx(refreshedIssue)} turn=${turnNumber}/${maxTurns}`);
   }
 }
 
@@ -348,29 +294,23 @@ function workerHostsForLog(hosts: Array<string | null>): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// Factory helpers
+// Pending plan / question detection (via WorkspaceIO)
 // ---------------------------------------------------------------------------
 
-async function hasPendingPlan(containerName: string): Promise<boolean> {
+async function hasPendingPlan(io: WorkspaceIO, ref: WorkspaceRef): Promise<boolean> {
   try {
-    const content = await dockerExecRead(containerName, '/workspace/.symphony/pending_plan.md');
+    const content = await io.readFile(ref, '.symphony/pending_plan.md');
     return content != null && content.trim() !== '';
   } catch {
     return false;
   }
 }
 
-async function hasQuestion(containerName: string): Promise<boolean> {
+async function hasQuestion(io: WorkspaceIO, ref: WorkspaceRef): Promise<boolean> {
   try {
-    const content = await dockerExecRead(containerName, '/workspace/.symphony/question.md');
+    const content = await io.readFile(ref, '.symphony/question.md');
     return content != null && content.trim() !== '';
   } catch {
     return false;
   }
-}
-
-function createWorkspaceBackend(config: Config): WorkspaceBackend {
-  return config.workspace_backend === 'docker'
-    ? new DockerWorkspaceBackend(config)
-    : new LocalWorkspaceBackend(config);
 }

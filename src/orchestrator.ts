@@ -11,8 +11,8 @@
  *  - Select which agents to run for each issue (trigger matching)
  *  - Dispatch issues to agent runners (respecting concurrency limits)
  *  - Track running/completed/failed agents
- *  - Handle repository PR events (approved → terminal, changes_requested →
- *    reschedule, new_comments → reschedule with pr_feedback.json)
+ *  - Handle repository PR events (new_comments → reschedule with
+ *    pr_feedback.json, pr_merged → cleanup)
  *  - Detect stalled agents and clean up
  */
 
@@ -20,19 +20,18 @@ import { EventEmitter } from 'node:events';
 import { logger } from './logger.js';
 import { runIssue } from './agent-runner.js';
 import { RepoPoller } from './repository/poller.js';
+import { TrackerPoller } from './tracker/poller.js';
 import { LinearClient } from './tracker/linear.js';
 import { JiraClient } from './tracker/jira.js';
-import { DockerWorkspaceBackend } from './workspace/docker.js';
-import { LocalWorkspaceBackend } from './workspace/local.js';
-import { createWorkspaceIO } from './workspace/io.js';
+import { createWorkspaceIO, createWorkspaceBackend } from './workspace/io.js';
 import { SlackPoller, type SlackResponseEvent } from './slack/poller.js';
 import { sendSlackMessage, sendSlackMessageChunked } from './slack/notifier.js';
 import { ReviewOrchestrator } from './review/orchestrator.js';
-import { formatReviewMessage, buildAgentSummary } from './review/formatter.js';
+// review/formatter.js removed — review results are now plain text from agents
 import { CostTracker } from './cost-tracker.js';
 import { ConcurrencyLimiter } from './concurrency-limiter.js';
-import type { Issue, TrackerClient, RepoEvent, AgentMessage, Comment, WorkspaceRef, WorkspaceIO } from './types.js';
-import type { Config, TrackerConfig, AgentConfig } from './config/schema.js';
+import type { Issue, TrackerClient, RepoEvent, AgentMessage, Comment, WorkspaceRef, WorkspaceIO, DispatchReason } from './types.js';
+import type { Config, TrackerConfig, AgentConfig, ClaudeAgentConfig } from './config/schema.js';
 
 export interface RunningEntry {
   issue: Issue;
@@ -42,8 +41,8 @@ export interface RunningEntry {
   workspacePath: string | null;
   containerName: string | null;
   agentLogLines: string[];
-  /** true = dispatched from a repo event; exempt from reconcileRunning */
-  fromRepoEvent: boolean;
+  /** Why this agent was dispatched */
+  reason: DispatchReason;
   abortController: AbortController;
   retryCount: number;
   /** true if this entry consumed a concurrency limiter slot (release on completion) */
@@ -78,12 +77,12 @@ export class Orchestrator extends EventEmitter {
   private pendingDispatch = new Set<string>(); // identifier → resolving/dispatching
   private watchedIssues = new Map<string, Issue>(); // identifier → last-known Issue
   private queuedComments = new Map<string, { comments: Comment[]; prLabels: string[] }>(); // identifier → queued PR comments
-  private queuedReviewEvent = new Map<string, { kind: 'review_approved' | 'changes_requested'; prLabels: string[] }>(); // identifier → latest queued review
+  private recentlyMerged = new Map<string, number>(); // identifier → timestamp
   private completedCount = 0;
   private failedCount = 0;
   private repoEvents: RepoEventRecord[] = [];
 
-  private pollTimer: NodeJS.Timeout | null = null;
+  private trackerPoller: TrackerPoller | null = null;
   private repoPoller: RepoPoller | null = null;
   private slackPoller: SlackPoller | null = null;
   private readonly limiter: ConcurrencyLimiter;
@@ -109,14 +108,19 @@ export class Orchestrator extends EventEmitter {
   start(): void {
     logger.info(`Orchestrator starting for tracker kind=${this.trackerConfig.kind}`);
     void this.recoverFromWorkspaces();
-    this.schedulePoll(0);
+    this.trackerPoller = new TrackerPoller(
+      this.tracker,
+      this.trackerConfig.poll_interval_ms,
+      (candidates) => this.handleCandidates(candidates),
+    );
+    this.trackerPoller.start();
     this.startRepoPoller();
     this.startSlackPoller();
   }
 
   stop(): void {
     this.stopped = true;
-    if (this.pollTimer) clearTimeout(this.pollTimer);
+    this.trackerPoller?.stop();
     this.repoPoller?.stop();
     this.slackPoller?.stop();
     for (const entry of this.running.values()) {
@@ -174,7 +178,7 @@ export class Orchestrator extends EventEmitter {
           if (this.running.has(issue.id)) continue;
 
           logger.info(`Recovery: re-dispatching ${identifier} (state="${issue.state}")`);
-          this.dispatch(issue);
+          this.dispatch(issue, { reason: 'recovery' });
         } catch (err) {
           logger.warn(`Recovery: failed to process workspace ${ws.name}`, { error: String(err) });
         }
@@ -195,37 +199,20 @@ export class Orchestrator extends EventEmitter {
   }
 
   // ---------------------------------------------------------------------------
-  // Polling
+  // Candidate handling (called by TrackerPoller)
   // ---------------------------------------------------------------------------
 
-  private schedulePoll(delayMs: number): void {
-    if (this.stopped) return;
-    if (this.pollTimer) clearTimeout(this.pollTimer);
-    this.pollTimer = setTimeout(() => this.poll(), delayMs);
-  }
-
-  private async poll(): Promise<void> {
+  private async handleCandidates(candidates: Issue[]): Promise<void> {
     if (this.stopped) return;
 
-    try {
-      await this.doPoll();
-    } catch (err) {
-      logger.error('Orchestrator poll failed', { error: String(err) });
-    } finally {
-      this.schedulePoll(this.trackerConfig.poll_interval_ms);
+    // Prune expired recentlyMerged entries
+    const ttl = this.trackerConfig.poll_interval_ms * 2;
+    const now = Date.now();
+    for (const [id, ts] of this.recentlyMerged) {
+      if (now - ts > ttl) this.recentlyMerged.delete(id);
     }
-  }
 
-  private async doPoll(): Promise<void> {
     this.pruneStaleAgents();
-
-    let candidates: Issue[];
-    try {
-      candidates = await this.tracker.fetchCandidateIssues();
-    } catch (err) {
-      logger.error('Failed to fetch candidate issues', { error: String(err) });
-      return;
-    }
 
     logger.info(
       `Poll: found ${candidates.length} candidate issue(s) for tracker ${trackerLabel(this.trackerConfig)} (${this.running.size} running)`,
@@ -320,7 +307,7 @@ export class Orchestrator extends EventEmitter {
 
   private dispatch(
     issue: Issue,
-    opts: { prLabels?: string[]; fromRepoEvent?: boolean; retryCount?: number } = {},
+    opts: { prLabels?: string[]; reason?: DispatchReason; retryCount?: number; isApproval?: boolean } = {},
   ): void {
     if (this.stopped) return;
     if (this.running.has(issue.id)) {
@@ -328,9 +315,9 @@ export class Orchestrator extends EventEmitter {
       return;
     }
 
-    const { prLabels, fromRepoEvent = false, retryCount = 0 } = opts;
+    const { prLabels, reason = 'new_issue', retryCount = 0, isApproval } = opts;
     const acquiredSlot = this.limiter.tryAcquire();
-    if (!acquiredSlot && !fromRepoEvent) {
+    if (!acquiredSlot) {
       logger.info(`Global concurrency limit reached; skipping dispatch for ${issue.identifier}`);
       return;
     }
@@ -342,8 +329,12 @@ export class Orchestrator extends EventEmitter {
       return;
     }
 
+    // Determine model based on phase
+    const model = this.resolveModel(agents, reason, isApproval, issue);
+
     logger.info(
-      `Dispatching issue ${issue.identifier} to ${agents.map((a) => a.kind).join(', ')} agent(s)`,
+      `Dispatching issue ${issue.identifier} to ${agents.map((a) => a.kind).join(', ')} agent(s)` +
+        (model ? ` model=${model}` : ''),
     );
 
     const abortController = new AbortController();
@@ -356,7 +347,7 @@ export class Orchestrator extends EventEmitter {
       workspacePath: null,
       containerName: null,
       agentLogLines: [],
-      fromRepoEvent,
+      reason,
       abortController,
       retryCount,
       acquiredSlot,
@@ -365,8 +356,13 @@ export class Orchestrator extends EventEmitter {
     const promise = runIssue(issue, this.tracker, this.config, this.promptTemplate, agents, {
       trackerKind: this.trackerConfig.kind,
       repositoryKind: this.trackerConfig.repository?.kind,
+      repository: this.trackerConfig.repository,
       activeStates: this.trackerConfig.active_states,
+      states: this.trackerConfig.states,
       signal: abortController.signal,
+      reason,
+      model,
+      io: this.io,
       onMessage: (msg: AgentMessage) => this.handleAgentMessage(issue.id, msg),
       onTurnComplete: (info) => {
         this.costTracker.record(issue.identifier, info.cost, info.tokensTotal);
@@ -385,7 +381,7 @@ export class Orchestrator extends EventEmitter {
 
     // 처음 폴링된 이슈 → Slack 스레드 생성 (이후 계획이 같은 스레드에 올라감)
     // 복구 디스패치(컨테이너가 이미 존재)에서는 보내지 않음
-    if (!fromRepoEvent && this.slackPoller && this.config.slack && !this.slackPoller.isWatching(issue.identifier)) {
+    if (reason === 'new_issue' && this.slackPoller && this.config.slack && !this.slackPoller.isWatching(issue.identifier)) {
       const ref = this.io.refForIssue(issue);
       void this.io.exists(ref).then((exists) => {
         if (!exists) return this.notifyPlanStart(issue);
@@ -414,8 +410,9 @@ export class Orchestrator extends EventEmitter {
             await this.notifyWorkComplete(issue);
           }
           await this.clearPrFeedback(issue);
-          this.drainCommentQueue(issue.identifier);
-          this.drainReviewQueue(issue.identifier);
+          if (!this.recentlyMerged.has(issue.identifier)) {
+            this.drainCommentQueue(issue.identifier);
+          }
           await this.cleanupTerminalWorkspace(issue);
         } catch (err) {
           logger.error(`Post-processing failed for ${issue.identifier}`, { error: String(err) });
@@ -431,6 +428,13 @@ export class Orchestrator extends EventEmitter {
         }
         this.trackWatchedIssue(issue);
 
+        // Skip retry/drain if recently merged
+        if (this.recentlyMerged.has(issue.identifier)) {
+          this.failedCount++;
+          this.emit('agent:failed', issue, err);
+          return;
+        }
+
         // Auto-retry if issue is still active and retries remain
         const maxRetries = this.config.agent.max_retries ?? 2;
         if (retryCount < maxRetries) {
@@ -442,7 +446,7 @@ export class Orchestrator extends EventEmitter {
                 const delayMs = this.config.agent.retry_backoff_ms * Math.pow(2, retryCount);
                 logger.info(`Retrying ${issue.identifier} in ${delayMs}ms (retry ${retryCount + 1}/${maxRetries})`);
                 setTimeout(() => {
-                  this.dispatch(refreshed, { fromRepoEvent, retryCount: retryCount + 1 });
+                  this.dispatch(refreshed, { reason: 'retry', retryCount: retryCount + 1 });
                 }, delayMs);
                 return;
               }
@@ -454,7 +458,6 @@ export class Orchestrator extends EventEmitter {
 
         this.failedCount++;
         this.drainCommentQueue(issue.identifier);
-        this.drainReviewQueue(issue.identifier);
         this.emit('agent:failed', issue, err);
       });
 
@@ -482,7 +485,7 @@ export class Orchestrator extends EventEmitter {
   private async reconcileRunning(candidates: Issue[]): Promise<void> {
     const candidateIds = new Set(candidates.map((i) => i.id));
     const terminalIds = [...this.running.entries()]
-      .filter(([id, entry]) => !candidateIds.has(id) && !entry.fromRepoEvent)
+      .filter(([id, entry]) => !candidateIds.has(id) && entry.reason === 'new_issue')
       .map(([id]) => id);
 
     for (const id of terminalIds) {
@@ -537,6 +540,60 @@ export class Orchestrator extends EventEmitter {
   }
 
   // ---------------------------------------------------------------------------
+  // Phase / model resolution
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Determine which model to use based on dispatch context.
+   * Returns the model alias (e.g. 'opus', 'sonnet') or undefined if no models configured.
+   */
+  private resolveModel(
+    agents: AgentConfig[],
+    reason: DispatchReason,
+    isApproval?: boolean,
+    issue?: Issue,
+  ): string | undefined {
+    // Find the first Claude agent with models configured
+    const claudeAgent = agents.find((a): a is ClaudeAgentConfig => a.kind === 'claude' && 'models' in a);
+    if (!claudeAgent?.models) return undefined;
+
+    const phase = this.determinePhase(reason, isApproval, issue);
+    const model = phase === 'planning' ? claudeAgent.models.planning : claudeAgent.models.implementation;
+
+    logger.info(`Phase=${phase}, model=${model}`, { reason, isApproval });
+    return model;
+  }
+
+  private determinePhase(
+    reason: DispatchReason,
+    isApproval?: boolean,
+    issue?: Issue,
+  ): 'planning' | 'implementation' {
+    if (reason === 'new_issue' || reason === 'pr_feedback') return 'planning';
+
+    if (reason === 'slack_response') {
+      return isApproval ? 'implementation' : 'planning';
+    }
+
+    // retry/recovery — check workspace for pending_plan.md
+    if (issue) {
+      try {
+        const ref = this.io.refForIssue(issue);
+        // Synchronous check not possible; fall back to heuristic based on issue state
+        const planningStates = [
+          this.trackerConfig.states.planning.toLowerCase(),
+          this.trackerConfig.states.plan_review.toLowerCase(),
+        ];
+        if (planningStates.includes(issue.state.toLowerCase().trim())) {
+          return 'planning';
+        }
+      } catch { /* fall through */ }
+    }
+
+    return 'implementation';
+  }
+
+  // ---------------------------------------------------------------------------
   // Workspace cleanup
   // ---------------------------------------------------------------------------
 
@@ -561,12 +618,14 @@ export class Orchestrator extends EventEmitter {
     if (this.slackPoller?.isWatching(issue.identifier) && this.config.slack) {
       const thread = this.slackPoller.getThread(issue.identifier);
       if (thread) {
-        void sendSlackMessage(
+        await sendSlackMessage(
           this.config.slack.bot_token,
           thread.threadInfo.channel,
           `:white_check_mark: *${issue.identifier}* 작업 완료`,
           thread.threadInfo.thread_ts,
-        );
+        ).catch((err) => {
+          logger.warn(`Failed to send Slack completion message for ${issue.identifier}`, { error: String(err) });
+        });
       }
       this.slackPoller.unwatch(issue.identifier);
     }
@@ -585,10 +644,7 @@ export class Orchestrator extends EventEmitter {
     logger.info(`Issue ${issue.identifier} reached terminal state; cleaning up workspace`);
 
     try {
-      const backend = this.config.workspace_backend === 'docker'
-        ? new DockerWorkspaceBackend(this.config)
-        : new LocalWorkspaceBackend(this.config);
-
+      const backend = createWorkspaceBackend(this.config, this.trackerConfig.repository);
       const ref = this.io.refForIssue(issue);
       await backend.cleanup(ref, latest);
     } catch (err) {
@@ -661,7 +717,7 @@ export class Orchestrator extends EventEmitter {
    * Two paths:
    *  1. pending_review.md already exists → agent already wrote it, just send to Slack.
    *  2. pending_review.md does not exist + review.enabled → run ReviewOrchestrator,
-   *     write pending_review.md + review_findings.json, then send to Slack.
+   *     write pending_review.md, then send to Slack.
    */
   private async handlePendingReview(issue: Issue): Promise<boolean> {
     if (!this.slackPoller || !this.config.slack) return false;
@@ -683,26 +739,7 @@ export class Orchestrator extends EventEmitter {
         if (!diff?.trim()) return false;
 
         const reviewOrch = new ReviewOrchestrator(ref);
-        const findings = await reviewOrch.run(diff, this.config.review, this.config.agents);
-
-        if (findings.length === 0) {
-          logger.info(`Self-review found no issues for ${issue.identifier}`);
-          return false;
-        }
-
-        // Write artifacts
-        await this.io.writeFile(
-          ref,
-          '.symphony/review_findings.json',
-          JSON.stringify(findings, null, 2),
-        );
-
-        const agentSummary = buildAgentSummary(
-          this.config.review.agents,
-          this.config.review.rounds,
-          this.config.review.validator,
-        );
-        reviewText = formatReviewMessage(findings, agentSummary);
+        reviewText = await reviewOrch.run(diff, this.config.review, this.config.agents);
 
         await this.io.writeFile(ref, '.symphony/pending_review.md', reviewText);
       } catch (err) {
@@ -854,7 +891,7 @@ export class Orchestrator extends EventEmitter {
 
       if (!(await this.io.exists(ref))) {
         logger.info(`Workspace ${event.workspaceName} not found; dispatching fresh run for ${identifier}`);
-        this.dispatch(issue, { fromRepoEvent: true });
+        this.dispatch(issue, { reason: 'slack_response', isApproval: event.isApproval });
         return;
       }
 
@@ -875,7 +912,7 @@ export class Orchestrator extends EventEmitter {
         }
       }
 
-      this.dispatch(issue, { fromRepoEvent: true });
+      this.dispatch(issue, { reason: 'slack_response', isApproval: event.isApproval });
     } finally {
       this.pendingDispatch.delete(identifier);
     }
@@ -909,7 +946,7 @@ export class Orchestrator extends EventEmitter {
     const repoCfg = this.trackerConfig.repository;
     if (!repoCfg) return;
 
-    this.repoPoller = new RepoPoller(repoCfg, (event) => this.handleRepoEvent(event));
+    this.repoPoller = new RepoPoller(repoCfg, (event) => this.handleRepoEvent(event), this.config.workspace.root);
     this.repoPoller.start();
   }
 
@@ -929,20 +966,6 @@ export class Orchestrator extends EventEmitter {
     const identifier = event.pr.issueIdentifier;
 
     switch (event.kind) {
-      case 'review_approved':
-        logger.info(`PR #${event.pr.number} approved for issue ${identifier ?? 'unknown'}`);
-        if (identifier) {
-          void this.handleReviewApproved(identifier, event.pr.labels);
-        }
-        break;
-
-      case 'changes_requested':
-        logger.info(`Changes requested on PR #${event.pr.number} for issue ${identifier ?? 'unknown'}`);
-        if (identifier) {
-          void this.handleChangesRequested(identifier, event.pr.labels);
-        }
-        break;
-
       case 'new_comments':
         logger.info(`New comments on PR #${event.pr.number} for issue ${identifier ?? 'unknown'}`);
         if (identifier) {
@@ -956,38 +979,6 @@ export class Orchestrator extends EventEmitter {
           void this.handlePRMerged(identifier, event.pr);
         }
         break;
-    }
-  }
-
-  private async handleReviewApproved(identifier: string, prLabels: string[]): Promise<void> {
-    if (this.isRunningByIdentifier(identifier) || this.pendingDispatch.has(identifier)) {
-      logger.info(`Review approved for ${identifier}: agent busy, queueing`);
-      this.queuedReviewEvent.set(identifier, { kind: 'review_approved', prLabels });
-      return;
-    }
-    this.pendingDispatch.add(identifier);
-    try {
-      const issue = await this.resolveIssueFromIdentifier(identifier, true);
-      if (!issue) return;
-      this.dispatch(issue, { prLabels, fromRepoEvent: true });
-    } finally {
-      this.pendingDispatch.delete(identifier);
-    }
-  }
-
-  private async handleChangesRequested(identifier: string, prLabels: string[]): Promise<void> {
-    if (this.isRunningByIdentifier(identifier) || this.pendingDispatch.has(identifier)) {
-      logger.info(`Changes requested for ${identifier}: agent busy, queueing`);
-      this.queuedReviewEvent.set(identifier, { kind: 'changes_requested', prLabels });
-      return;
-    }
-    this.pendingDispatch.add(identifier);
-    try {
-      const issue = await this.resolveIssueFromIdentifier(identifier, true);
-      if (!issue) return;
-      this.dispatch(issue, { prLabels, fromRepoEvent: true });
-    } finally {
-      this.pendingDispatch.delete(identifier);
     }
   }
 
@@ -1021,7 +1012,7 @@ export class Orchestrator extends EventEmitter {
 
       this.dispatch(issue, {
         prLabels,
-        fromRepoEvent: true,
+        reason: 'pr_feedback',
       });
     } finally {
       this.pendingDispatch.delete(identifier);
@@ -1052,6 +1043,8 @@ export class Orchestrator extends EventEmitter {
         }
       }
 
+      this.recentlyMerged.set(identifier, Date.now());
+
       const issue = await this.resolveIssueFromIdentifier(identifier, true);
       if (!issue) return;
 
@@ -1080,19 +1073,22 @@ export class Orchestrator extends EventEmitter {
       if (this.slackPoller && this.config.slack) {
         const thread = this.slackPoller.getThread(identifier);
         if (thread) {
-          void sendSlackMessage(
-            this.config.slack.bot_token,
-            thread.threadInfo.channel,
-            `:merged: *${identifier}* PR이 머지되어 작업이 완료되었습니다.`,
-            thread.threadInfo.thread_ts,
-          );
+          try {
+            await sendSlackMessage(
+              this.config.slack.bot_token,
+              thread.threadInfo.channel,
+              `:merged: *${identifier}* PR이 머지되어 작업이 완료되었습니다.`,
+              thread.threadInfo.thread_ts,
+            );
+          } catch (err) {
+            logger.warn(`Failed to send Slack merge notification for ${identifier}`, { error: String(err) });
+          }
         }
         this.slackPoller.unwatch(identifier);
       }
 
       // 4. Clean up queues
       this.queuedComments.delete(identifier);
-      this.queuedReviewEvent.delete(identifier);
 
       // 5. Clean up workspace
       await this.cleanupTerminalWorkspace(issue);
@@ -1126,19 +1122,6 @@ export class Orchestrator extends EventEmitter {
     void this.handleNewComments(identifier, queued.prLabels, queued.comments);
   }
 
-  private drainReviewQueue(identifier: string): void {
-    const queued = this.queuedReviewEvent.get(identifier);
-    if (!queued) return;
-
-    this.queuedReviewEvent.delete(identifier);
-    logger.info(`Draining queued review event (${queued.kind}) for ${identifier}`);
-    if (queued.kind === 'review_approved') {
-      void this.handleReviewApproved(identifier, queued.prLabels);
-    } else {
-      void this.handleChangesRequested(identifier, queued.prLabels);
-    }
-  }
-
   /**
    * Slack 승인 대기 중 새 댓글 도착 → pr_feedback.json에 병합 후 에이전트 재실행.
    * 에이전트가 전체 피드백을 반영한 plan을 재작성하여 Slack 스레드에 업데이트.
@@ -1156,7 +1139,7 @@ export class Orchestrator extends EventEmitter {
       const ref = this.io.refForIssue(issue);
       if (!(await this.io.exists(ref))) {
         logger.info(`Workspace not found for ${identifier}; dispatching fresh run`);
-        this.dispatch(issue, { prLabels, fromRepoEvent: true });
+        this.dispatch(issue, { prLabels, reason: 'pr_feedback' });
         return;
       }
 
@@ -1181,7 +1164,7 @@ export class Orchestrator extends EventEmitter {
 
       this.dispatch(issue, {
         prLabels,
-        fromRepoEvent: true,
+        reason: 'pr_feedback',
       });
     } finally {
       this.pendingDispatch.delete(identifier);

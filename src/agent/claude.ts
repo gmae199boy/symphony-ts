@@ -54,7 +54,7 @@ export class ClaudeBackend implements AgentBackend {
     const containerLabel = opts.containerName ?? 'local';
     logger.info(
       `Starting Claude agent for ${issueCtx(issue)} workspace=${workspace}` +
-        ` container=${containerLabel} session_id=${opts.sessionId ?? 'null'}`,
+        ` container=${containerLabel}`,
     );
 
     const output = await spawnClaude(workspace, args, opts, timeoutMs, issue, opts.onMessage, this.config);
@@ -207,11 +207,15 @@ function buildArgs(
     '--output-format', 'json',
   ];
 
+  if (opts.model) {
+    args.push('--model', opts.model);
+  }
+
   if (opts.containerName) {
     args.push('--dangerously-skip-permissions');
   }
 
-  if (opts.sessionId) args.push('--continue');
+  args.push('--continue');
   if (agentConfig.max_turns) args.push('--max-turns', String(agentConfig.max_turns));
   if (agentConfig.max_budget_usd) args.push('--max-budget-usd', String(agentConfig.max_budget_usd));
   if (agentConfig.mcp_config) {
@@ -254,14 +258,13 @@ function parseResult(output: string, issue: Issue): AgentRunResult {
   }
 
   const data: ClaudeOutput = result.data;
-  const sessionId = data.session_id ?? null;
   const cost = data.total_cost_usd;
   const tokensTotal =
     data.usage
       ? (data.usage.input_tokens ?? 0) + (data.usage.output_tokens ?? 0)
       : undefined;
 
-  logger.info(`Claude turn complete for ${issueCtx(issue)}`, { sessionId, costUsd: cost });
+  logger.info(`Claude turn complete for ${issueCtx(issue)}`, { costUsd: cost });
 
-  return { sessionId, cost, tokensTotal };
+  return { cost, tokensTotal };
 }

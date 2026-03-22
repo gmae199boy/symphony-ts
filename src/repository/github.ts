@@ -261,12 +261,14 @@ export class GitHubClient {
     // Fallback: `gh auth token`
     try {
       const token = execFileSync('gh', ['auth', 'token'], { encoding: 'utf8' }).trim();
-      this.cachedToken = token || null;
+      if (!token) {
+        throw new Error('empty token');
+      }
+      this.cachedToken = token;
     } catch {
-      logger.warn(
-        'No GitHub token configured and `gh auth token` failed; requests will be unauthenticated',
+      throw new Error(
+        'GitHub token is required: configure token in WORKFLOW.md or run `gh auth login`',
       );
-      this.cachedToken = null;
     }
 
     return this.cachedToken;

@@ -1,48 +1,36 @@
 /**
- * Codex (OpenAI) app-server agent backend.
- * Mirrors elixir/lib/symphony_elixir/agent_backend/codex.ex
+ * Codex (OpenAI) CLI agent backend.
+ * Uses `codex exec` CLI mode (spawn → complete → exit), mirroring claude.ts.
+ *
+ * Session resumption:
+ *  1. Always try `codex exec resume --last "prompt"` first
+ *  2. If that fails (no previous session), fall back to `codex exec "prompt"`
  *
  * All JSON parsing uses Zod schemas. No type assertions (`as`) are used.
  */
 
-import { spawn, ChildProcess } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { z } from 'zod';
 import { logger } from '../logger.js';
 import { issueCtx } from '../utils.js';
+import { shellEscape } from '../shell-utils.js';
 import type { Issue, AgentBackend, AgentRunOpts, AgentRunResult, AgentMessage } from '../types.js';
 import type { CodexAgentConfig } from '../config/schema.js';
 
 // ---------------------------------------------------------------------------
-// Zod schemas for JSON-RPC 2.0
+// Zod schema for Codex CLI JSON output
 // ---------------------------------------------------------------------------
 
-const JsonRpcErrorSchema = z.object({
-  code: z.number(),
-  message: z.string(),
-  data: z.unknown().optional(),
-});
-
-const JsonRpcResponseSchema = z.object({
-  jsonrpc: z.literal('2.0'),
-  id: z.union([z.string(), z.number()]),
-  result: z.unknown().optional(),
-  error: JsonRpcErrorSchema.optional(),
-});
-
-const TurnResultSchema = z.object({
-  session_id: z.string().nullable().optional(),
+const CodexOutputSchema = z.object({
   total_tokens: z.number().optional(),
   result: z.string().optional(),
 });
 
-interface JsonRpcRequest {
-  jsonrpc: '2.0';
-  id: string | number;
-  method: string;
-  params?: unknown;
-}
+type CodexOutput = z.infer<typeof CodexOutputSchema>;
 
-let sessionCounter = 0;
+// ---------------------------------------------------------------------------
+// Backend
+// ---------------------------------------------------------------------------
 
 export class CodexBackend implements AgentBackend {
   private readonly config: CodexAgentConfig;
@@ -57,161 +45,218 @@ export class CodexBackend implements AgentBackend {
     issue: Issue,
     opts: AgentRunOpts,
   ): Promise<AgentRunResult> {
-    const parts = this.config.command.split(/\s+/);
-    const cmd = parts[0];
-    const cmdArgs = parts.slice(1);
+    const timeoutMs = opts.timeoutMs ?? 3_600_000;
 
-    logger.info(`Starting Codex agent for ${issueCtx(issue)} workspace=${workspace}`);
+    logger.info(
+      `Starting Codex agent for ${issueCtx(issue)} workspace=${workspace}` +
+        ` container=${opts.containerName ?? 'local'}`,
+    );
 
-    const child = spawn(cmd, cmdArgs, {
-      cwd: workspace,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-
-    // Abort signal support — kill child process when signal fires
-    const onAbort = () => { child.kill('SIGTERM'); };
-    if (opts.signal) {
-      if (opts.signal.aborted) {
-        child.kill('SIGTERM');
-        throw new Error('Codex run aborted');
-      }
-      opts.signal.addEventListener('abort', onAbort, { once: true });
-    }
-
+    // Try resume --last first, fall back to plain exec
     try {
-      const sessionId = `session-${Date.now()}-${++sessionCounter}`;
+      const args = buildArgs(prompt, this.config, true);
+      const output = await spawnCodex(workspace, args, opts, timeoutMs, issue, opts.onMessage, this.config);
+      return parseResult(output, issue);
+    } catch (resumeErr) {
+      // If aborted, don't retry
+      if (opts.signal?.aborted) throw resumeErr;
 
-      await rpcCall(child, sessionId, 'session.start', {
-        workdir: workspace,
-        approvalPolicy: this.config.approval_policy,
-        sandboxPolicy: this.config.turn_sandbox_policy,
-      });
+      logger.info(
+        `Codex resume --last failed for ${issueCtx(issue)}, falling back to fresh exec: ${resumeErr instanceof Error ? resumeErr.message : String(resumeErr)}`,
+      );
 
-      const result = await this.runTurn(child, sessionId, prompt, opts.onMessage);
-
-      await rpcCall(child, `stop-${sessionId}`, 'session.stop', {}, 5_000).catch(() => undefined);
-
-      return result;
-    } finally {
-      opts.signal?.removeEventListener('abort', onAbort);
-      child.kill();
+      const args = buildArgs(prompt, this.config, false);
+      const output = await spawnCodex(workspace, args, opts, timeoutMs, issue, opts.onMessage, this.config);
+      return parseResult(output, issue);
     }
-  }
-
-  private async runTurn(
-    child: ChildProcess,
-    sessionId: string,
-    prompt: string,
-    onMessage: ((m: AgentMessage) => void) | undefined,
-  ): Promise<AgentRunResult> {
-    const turnId = `turn-${Date.now()}`;
-    const raw = await rpcCall(child, turnId, 'turn.run', { sessionId, prompt });
-
-    const parsed = TurnResultSchema.safeParse(raw);
-
-    if (!parsed.success) {
-      logger.warn('Unexpected Codex turn result shape', { error: parsed.error.message });
-      return { sessionId: null };
-    }
-
-    const data = parsed.data;
-
-    if (onMessage && data.result) {
-      for (const line of data.result.split('\n')) {
-        onMessage({ event: { type: 'output', line }, timestamp: new Date() });
-      }
-    }
-
-    return {
-      sessionId: data.session_id ?? null,
-      tokensTotal: data.total_tokens,
-    };
   }
 }
 
 // ---------------------------------------------------------------------------
-// JSON-RPC over stdio
+// Spawn
 // ---------------------------------------------------------------------------
 
-function rpcCall(
-  child: ChildProcess,
-  id: string | number,
-  method: string,
-  params: unknown,
-  timeoutMs = 60_000,
-): Promise<unknown> {
+function spawnCodex(
+  workspace: string,
+  args: string[],
+  opts: AgentRunOpts,
+  timeoutMs: number,
+  issue: Issue,
+  onMessage: ((m: AgentMessage) => void) | undefined,
+  agentConfig: CodexAgentConfig,
+): Promise<string> {
   return new Promise((resolve, reject) => {
-    const request: JsonRpcRequest = { jsonrpc: '2.0', id, method, params };
-    let settled = false;
+    let cmd: string;
+    let spawnArgs: string[];
+    let cwd: string;
+
+    if (opts.containerName) {
+      cmd = 'docker';
+      const codexCmd = ['codex', ...args].map(shellEscape).join(' ');
+      const innerCmd = `cd ${shellEscape(workspace)} && ${codexCmd}`;
+      spawnArgs = ['exec', '-i', '--user', 'worker', opts.containerName, 'bash', '-lc', innerCmd];
+      cwd = process.cwd();
+    } else {
+      const parts = agentConfig.command.split(/\s+/);
+      cmd = parts[0];
+      spawnArgs = args;
+      cwd = workspace;
+    }
+
+    const child = spawn(cmd, spawnArgs, {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const lines: string[] = [];
+    let timedOut = false;
+
+    let aborted = false;
+    const onAbort = () => {
+      aborted = true;
+      child.kill('SIGTERM');
+      clearTimeout(timer);
+      reject(new Error('Codex turn aborted'));
+    };
 
     const timer = setTimeout(() => {
-      cleanup();
-      reject(new Error(`RPC call ${method} timed out after ${timeoutMs}ms`));
+      timedOut = true;
+      child.kill('SIGTERM');
+      opts.signal?.removeEventListener('abort', onAbort);
+      reject(new Error(`Codex turn timed out after ${timeoutMs}ms`));
     }, timeoutMs);
 
-    let buf = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
 
-    const onData = (chunk: Buffer) => {
-      buf += chunk.toString('utf8');
-      const lines = buf.split('\n');
-      buf = lines.pop() ?? '';
+    const handleLine = (line: string) => {
+      lines.push(line);
+      onMessage?.({
+        event: { type: 'output', line },
+        timestamp: new Date(),
+      });
+    };
 
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
+    let stdoutBuf = '';
+    child.stdout.on('data', (chunk: string) => {
+      stdoutBuf += chunk;
+      const parts = stdoutBuf.split('\n');
+      stdoutBuf = parts.pop() ?? '';
+      parts.forEach(handleLine);
+    });
 
-        let rawParsed: unknown;
-        try {
-          rawParsed = JSON.parse(trimmed);
-        } catch {
-          continue; // not JSON — skip
+    const containerCtx = opts.containerName ?? 'local';
+
+    let stderrBuf = '';
+    child.stderr.on('data', (chunk: string) => {
+      stderrBuf += chunk;
+      const parts = stderrBuf.split('\n');
+      stderrBuf = parts.pop() ?? '';
+      parts.forEach((line) => {
+        handleLine(line);
+        if (line.trim()) {
+          logger.warn(`[${containerCtx}] ${line}`, { issue: issueCtx(issue) });
         }
+      });
+    });
 
-        const msg = JsonRpcResponseSchema.safeParse(rawParsed);
-        if (!msg.success) continue;
-
-        if (msg.data.id === id) {
-          cleanup();
-          if (msg.data.error) {
-            reject(
-              new Error(
-                `JSON-RPC error ${msg.data.error.code}: ${msg.data.error.message}`,
-              ),
-            );
-          } else {
-            resolve(msg.data.result);
-          }
-        }
+    if (opts.signal) {
+      if (opts.signal.aborted) {
+        aborted = true;
+        child.kill('SIGTERM');
+        clearTimeout(timer);
+        reject(new Error('Codex turn aborted'));
+        return;
       }
-    };
-
-    const onError = (err: Error) => {
-      cleanup();
-      reject(err);
-    };
-
-    const onClose = () => {
-      cleanup();
-      reject(new Error('Codex process exited before RPC response'));
-    };
-
-    const cleanup = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      child.stdout?.off('data', onData);
-      child.off('error', onError);
-      child.off('close', onClose);
-    };
-
-    child.stdout?.on('data', onData);
-    child.on('error', onError);
-    child.on('close', onClose);
-    try {
-      child.stdin?.write(JSON.stringify(request) + '\n');
-    } catch (err) {
-      cleanup();
-      reject(err instanceof Error ? err : new Error(String(err)));
+      opts.signal.addEventListener('abort', onAbort, { once: true });
     }
+
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      opts.signal?.removeEventListener('abort', onAbort);
+      if (timedOut || aborted) return;
+
+      if (stdoutBuf) { lines.push(stdoutBuf); }
+      if (stderrBuf) {
+        lines.push(stderrBuf);
+        logger.warn(`[${containerCtx}] ${stderrBuf}`, { issue: issueCtx(issue) });
+      }
+
+      const output = lines.join('\n');
+
+      if (code === 0) {
+        resolve(output);
+      } else {
+        logger.warn(`Codex exited with code ${code} for ${issueCtx(issue)}`, {
+          preview: output.slice(0, 500),
+        });
+        reject(new Error(`Codex exited with code ${code}`));
+      }
+    });
+
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      opts.signal?.removeEventListener('abort', onAbort);
+      reject(err);
+    });
   });
+}
+
+// ---------------------------------------------------------------------------
+// Arg builder
+// ---------------------------------------------------------------------------
+
+function buildArgs(
+  prompt: string,
+  agentConfig: CodexAgentConfig,
+  resume: boolean,
+): string[] {
+  const args: string[] = ['exec'];
+
+  if (resume) {
+    args.push('resume', '--last');
+  }
+
+  if (agentConfig.approval_policy === 'never') {
+    args.push('--full-auto');
+  }
+
+  args.push(prompt);
+
+  return args;
+}
+
+// ---------------------------------------------------------------------------
+// Output parsing — Zod, no `as`
+// ---------------------------------------------------------------------------
+
+function parseResult(output: string, issue: Issue): AgentRunResult {
+  const lines = output.split('\n').filter((l) => l.trim() !== '');
+  const lastLine = lines[lines.length - 1] ?? '';
+
+  let raw: unknown;
+  try {
+    raw = JSON.parse(lastLine);
+  } catch {
+    // Codex may not output structured JSON — treat as successful with no metadata
+    logger.info(`Codex turn complete for ${issueCtx(issue)} (no structured output)`);
+    return {};
+  }
+
+  const result = CodexOutputSchema.safeParse(raw);
+
+  if (!result.success) {
+    logger.warn(`Unexpected Codex JSON shape for ${issueCtx(issue)}`, {
+      preview: lastLine.slice(0, 200),
+      error: result.error.message,
+    });
+    return {};
+  }
+
+  const data: CodexOutput = result.data;
+  const tokensTotal = data.total_tokens;
+
+  logger.info(`Codex turn complete for ${issueCtx(issue)}`, { tokensTotal });
+
+  return { tokensTotal };
 }

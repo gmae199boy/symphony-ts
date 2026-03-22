@@ -31,7 +31,7 @@ export interface BlockerRef {
 
 export type AgentEventKind =
   | { type: 'output'; line: string }
-  | { type: 'turn_complete'; sessionId: string | null; cost?: number; tokens?: number }
+  | { type: 'turn_complete'; cost?: number; tokens?: number }
   | { type: 'error'; reason: string };
 
 export interface AgentMessage {
@@ -85,12 +85,13 @@ export interface Comment {
   line?: number | null;    // inline 댓글의 줄 번호
 }
 
-export type RepoEventKind = 'review_approved' | 'changes_requested' | 'new_comments' | 'pr_merged';
+export type RepoEventKind = 'new_comments' | 'pr_merged';
+
+export type DispatchReason = 'new_issue' | 'recovery' | 'pr_feedback' | 'slack_response' | 'retry';
 
 export interface RepoEvent {
   kind: RepoEventKind;
   pr: PullRequest;
-  review?: Review;
   comment?: Comment;
   comments?: Comment[];  // new_comments 이벤트용
 }
@@ -144,7 +145,6 @@ export interface WorkspaceIO {
 // ---------------------------------------------------------------------------
 
 export interface AgentRunResult {
-  sessionId: string | null;
   cost?: number;
   tokensTotal?: number;
 }
@@ -156,14 +156,29 @@ export interface AgentBackend {
     issue: Issue,
     opts: AgentRunOpts,
   ): Promise<AgentRunResult>;
+  dispose?(): Promise<void>;
 }
 
+// ---------------------------------------------------------------------------
+// Messenger
+// ---------------------------------------------------------------------------
+
+export interface MessengerClient {
+  sendMessage(channel: string, text: string, threadTs?: string): Promise<{ ts: string; channel: string } | null>;
+  sendMessageChunked(channel: string, text: string, threadTs?: string, onMessageSent?: (ts: string) => void): Promise<{ ts: string; channel: string } | null>;
+}
+
+// ---------------------------------------------------------------------------
+// Agent run options
+// ---------------------------------------------------------------------------
+
 export interface AgentRunOpts {
-  sessionId?: string | null;
   maxTurns?: number;
   containerName?: string;
   workerHost?: string;
   onMessage?: AgentMessageHandler;
   timeoutMs?: number;
   signal?: AbortSignal;
+  /** Model override (e.g. 'opus', 'sonnet') — passed as --model flag to Claude CLI. */
+  model?: string;
 }

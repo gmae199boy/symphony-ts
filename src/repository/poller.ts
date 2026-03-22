@@ -6,19 +6,18 @@
  *
  * First-poll behaviour:
  *   - All existing IDs are seeded as "seen".
- *   - If the last actionable review is CHANGES_REQUESTED, a changes_requested
- *     event is emitted.
  *   - If the last comment is from a non-bot, a new_comments event is emitted.
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
 import { logger } from '../logger.js';
-import { GitHubClient } from './github.js';
-import { BitbucketClient } from './bitbucket.js';
-import type { PullRequest, Review, Comment, RepoEvent, RepoEventHandler } from '../types.js';
+import { Poller } from '../poller.js';
+import { createRepoClient, type RepoClientApi } from './factory.js';
+import type { PullRequest, Comment, RepoEvent, RepoEventHandler } from '../types.js';
 import type { RepositoryConfig } from '../config/schema.js';
 
 interface PRSeen {
-  reviewIds: Set<number>;
   commentIds: Set<string>; // namespaced: "issue:{id}" | "review:{id}"
 }
 
@@ -28,69 +27,39 @@ interface PollerState {
   firstPoll: boolean;
 }
 
-interface RepoClientApi {
-  fetchOpenPRs(): Promise<PullRequest[]>;
-  fetchPR(prNumber: number): Promise<PullRequest | null>;
-  deleteBranch(branchName: string): Promise<void>;
-  fetchPRReviews(prNumber: number): Promise<Review[]>;
-  fetchPRComments(prNumber: number): Promise<Comment[]>;
-}
-
-export class RepoPoller {
+export class RepoPoller extends Poller {
   private readonly config: RepositoryConfig;
   private readonly repoClient: RepoClientApi;
   private readonly onEvent: RepoEventHandler;
+  private readonly stateFilePath: string | null;
   private state: PollerState = { seen: new Map(), knownOpenPRs: new Map(), firstPoll: true };
-  private timer: NodeJS.Timeout | null = null;
 
-  constructor(config: RepositoryConfig, onEvent: RepoEventHandler) {
+  constructor(config: RepositoryConfig, onEvent: RepoEventHandler, workspaceRoot?: string) {
+    super(config.poll_interval_ms);
     this.config = config;
     this.onEvent = onEvent;
+    this.repoClient = createRepoClient(config);
 
-    if (config.kind === 'github') {
-      this.repoClient = new GitHubClient(config);
+    // Determine state file path for persistence
+    if (workspaceRoot) {
+      const label = config.kind === 'github' ? config.repo.replace(/\//g, '-') : `${config.workspace}-${config.repo_slug}`;
+      this.stateFilePath = path.join(workspaceRoot, `repo-poller-${label}-seen.json`);
     } else {
-      this.repoClient = new BitbucketClient(config);
+      this.stateFilePath = null;
     }
   }
 
-  start(): void {
-    if (this.timer) return;
-    logger.info('Repository poller starting', { kind: this.config.kind });
-    this.scheduleNext(0);
-  }
-
-  stop(): void {
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // Scheduling
-  // ---------------------------------------------------------------------------
-
-  private scheduleNext(delayMs: number): void {
-    if (this.timer) clearTimeout(this.timer);
-    this.timer = setTimeout(() => this.poll(), delayMs);
-  }
-
-  private async poll(): Promise<void> {
-    try {
-      await this.doPoll();
-    } catch (err) {
-      logger.warn('Repository poller: poll failed', { error: String(err) });
-    } finally {
-      this.scheduleNext(this.config.poll_interval_ms);
-    }
+  override start(): void {
+    this.restoreState();
+    logger.info('Repository poller starting', { kind: this.config.kind, restoredPRs: this.state.seen.size });
+    super.start();
   }
 
   // ---------------------------------------------------------------------------
   // Core poll logic
   // ---------------------------------------------------------------------------
 
-  private async doPoll(): Promise<void> {
+  protected override async doPoll(): Promise<void> {
     let prs: PullRequest[];
 
     try {
@@ -139,7 +108,7 @@ export class RepoPoller {
         const pr = await this.fetchPR(prNumber);
         if (pr && pr.state === 'merged') {
           logger.info(`Repository poller: PR #${prNumber} has been merged`);
-          this.emit({ kind: 'pr_merged', pr: knownPR });
+          this.emitEvent({ kind: 'pr_merged', pr: knownPR });
         } else {
           logger.debug(`Repository poller: PR #${prNumber} disappeared but state=${pr?.state ?? 'unknown'}, ignoring`);
         }
@@ -166,18 +135,10 @@ export class RepoPoller {
 
   private async checkPR(pr: PullRequest): Promise<void> {
     const prSeen = this.state.seen.get(pr.number) ?? {
-      reviewIds: new Set<number>(),
       commentIds: new Set<string>(),
     };
 
     const updatedSeen = { ...prSeen };
-
-    try {
-      const reviews = await this.fetchPRReviews(pr.number);
-      updatedSeen.reviewIds = this.processReviews(pr, reviews, prSeen.reviewIds);
-    } catch (err) {
-      logger.debug('Repository poller: failed to fetch reviews', { pr: pr.number, error: String(err) });
-    }
 
     try {
       const comments = await this.fetchPRComments(pr.number);
@@ -187,58 +148,11 @@ export class RepoPoller {
     }
 
     this.state.seen.set(pr.number, updatedSeen);
-  }
-
-  private async fetchPRReviews(prNumber: number): Promise<Review[]> {
-    return this.repoClient.fetchPRReviews(prNumber);
+    this.persistState();
   }
 
   private async fetchPRComments(prNumber: number): Promise<Comment[]> {
     return this.repoClient.fetchPRComments(prNumber);
-  }
-
-  // ---------------------------------------------------------------------------
-  // Reviews
-  // ---------------------------------------------------------------------------
-
-  private processReviews(pr: PullRequest, reviews: Review[], seenIds: Set<number>): Set<number> {
-    const allIds = new Set(reviews.map((r) => r.id));
-
-    if (this.state.firstPoll) {
-      this.handleFirstPollReviews(pr, reviews);
-      return allIds;
-    }
-
-    const newReviews = reviews.filter((r) => !seenIds.has(r.id));
-    for (const review of newReviews) {
-      this.emitReviewEvent(pr, review);
-    }
-
-    const updated = new Set(seenIds);
-    newReviews.forEach((r) => updated.add(r.id));
-    return updated;
-  }
-
-  private handleFirstPollReviews(pr: PullRequest, reviews: Review[]): void {
-    const actionable = reviews.filter((r) =>
-      ['APPROVED', 'CHANGES_REQUESTED'].includes(r.state.toUpperCase()),
-    );
-    const last = actionable[actionable.length - 1];
-
-    if (last && last.state.toUpperCase() === 'CHANGES_REQUESTED') {
-      logger.info(`Repository poller: first poll detected pending changes_requested on PR #${pr.number}`);
-      this.emitReviewEvent(pr, last);
-    }
-  }
-
-  private emitReviewEvent(pr: PullRequest, review: Review): void {
-    const state = review.state.toUpperCase();
-
-    if (state === 'APPROVED') {
-      this.emit({ kind: 'review_approved', pr, review });
-    } else if (state === 'CHANGES_REQUESTED') {
-      this.emit({ kind: 'changes_requested', pr, review });
-    }
   }
 
   // ---------------------------------------------------------------------------
@@ -256,7 +170,7 @@ export class RepoPoller {
     const allNew = comments.filter((c) => !seenIds.has(c.id));
     const humanNew = allNew.filter((c) => !c.isBot);
     if (humanNew.length > 0) {
-      this.emit({ kind: 'new_comments', pr, comments: humanNew });
+      this.emitEvent({ kind: 'new_comments', pr, comments: humanNew });
     }
 
     // Add all new comments (including bot) to seen set
@@ -265,21 +179,52 @@ export class RepoPoller {
     return updated;
   }
 
-  private handleFirstPollComments(pr: PullRequest, comments: Comment[]): void {
-    const last = comments[comments.length - 1];
-    if (!last || last.isBot) return;
+  private handleFirstPollComments(_pr: PullRequest, _comments: Comment[]): void {
+    // On true first poll (no persisted state), seed all comments as "seen"
+    // without emitting events. New comments will be detected from the next cycle.
+  }
 
-    logger.info(
-      `Repository poller: first poll detected unanswered comment by ${last.authorLogin} on PR #${pr.number}`,
-    );
-    this.emit({ kind: 'new_comments', pr, comments: [last] });
+  // ---------------------------------------------------------------------------
+  // State persistence
+  // ---------------------------------------------------------------------------
+
+  private persistState(): void {
+    if (!this.stateFilePath) return;
+    try {
+      const data: Record<string, string[]> = {};
+      for (const [prNumber, prSeen] of this.state.seen) {
+        data[String(prNumber)] = [...prSeen.commentIds];
+      }
+      fs.mkdirSync(path.dirname(this.stateFilePath), { recursive: true });
+      const tmpPath = this.stateFilePath + '.tmp';
+      fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
+      fs.renameSync(tmpPath, this.stateFilePath);
+    } catch (err) {
+      logger.warn('RepoPoller: failed to persist state', { error: String(err) });
+    }
+  }
+
+  private restoreState(): void {
+    if (!this.stateFilePath) return;
+    try {
+      const raw = fs.readFileSync(this.stateFilePath, 'utf8');
+      const data = JSON.parse(raw) as Record<string, string[]>;
+      for (const [prNumber, commentIds] of Object.entries(data)) {
+        this.state.seen.set(Number(prNumber), { commentIds: new Set(commentIds) });
+      }
+      // Restored from disk → not a true first poll
+      this.state.firstPoll = false;
+      logger.info('RepoPoller: restored seen state from disk', { prs: this.state.seen.size });
+    } catch {
+      // No file or corrupted — start fresh (firstPoll stays true)
+    }
   }
 
   // ---------------------------------------------------------------------------
   // Emit
   // ---------------------------------------------------------------------------
 
-  private emit(event: RepoEvent): void {
+  private emitEvent(event: RepoEvent): void {
     logger.info(`Repository PR event: ${event.kind} pr=#${event.pr.number} issueIdentifier=${event.pr.issueIdentifier ?? 'null'}`);
     try {
       this.onEvent(event);

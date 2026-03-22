@@ -17,9 +17,24 @@
  *         repo: owner/repo
  *         token: $GITHUB_TOKEN
  *         event_source: polling
+ *         hooks:
+ *           after_create: |          # credentials 후, clone 전
+ *             echo "container ready"
+ *           after_clone: |           # clone 후
+ *             npm ci
+ *           before_run: |            # 매 에이전트 실행 전
+ *             git fetch origin
+ *           after_run: |             # 매 에이전트 실행 후
+ *             rm -rf node_modules/.cache
+ *           before_remove: |         # 워크스페이스 제거 전
+ *             echo "cleanup"
+ *           timeout_ms: 300000
  *
  *   agents:
  *     - kind: claude
+ *       models:
+ *         planning: opus
+ *         implementation: sonnet
  *       max_turns: 20
  *     - kind: codex
  *       trigger:
@@ -40,9 +55,9 @@ function resolveEnv(value: string): string {
   return value.replace(/\$([A-Z0-9_]+)/g, (_match, name: string) => {
     const val = process.env[name];
     if (val === undefined) {
-      console.warn(`[config] Environment variable $${name} is not set (referenced in config)`);
+      throw new Error(`Environment variable $${name} is not set (referenced in config)`);
     }
-    return val ?? '';
+    return val;
   });
 }
 
@@ -58,6 +73,19 @@ const optionalEnvString = z.preprocess(
 );
 
 // ---------------------------------------------------------------------------
+// Repository hooks
+// ---------------------------------------------------------------------------
+
+const repositoryHooksSchema = z.object({
+  after_create: z.string().nullable().optional(),
+  after_clone: z.string().nullable().optional(),
+  before_run: z.string().nullable().optional(),
+  after_run: z.string().nullable().optional(),
+  before_remove: z.string().nullable().optional(),
+  timeout_ms: z.number().int().positive().default(300_000),
+}).default({});
+
+// ---------------------------------------------------------------------------
 // Repository (GitHub / Bitbucket)
 // ---------------------------------------------------------------------------
 
@@ -69,6 +97,7 @@ const githubRepositorySchema = z.object({
   pr_label_filter: z.string().default('symphony'),
   event_source: z.enum(['polling', 'webhook']).default('polling'),
   webhook_secret: optionalEnvString,
+  hooks: repositoryHooksSchema,
 });
 
 const bitbucketRepositorySchema = z.object({
@@ -82,6 +111,7 @@ const bitbucketRepositorySchema = z.object({
   pr_label_filter: z.string().optional(),
   event_source: z.enum(['polling', 'webhook']).default('polling'),
   webhook_secret: optionalEnvString,
+  hooks: repositoryHooksSchema,
 });
 
 export const repositorySchema = z.discriminatedUnion('kind', [
@@ -94,12 +124,36 @@ export type GitHubRepositoryConfig = z.infer<typeof githubRepositorySchema>;
 export type BitbucketRepositoryConfig = z.infer<typeof bitbucketRepositorySchema>;
 
 // ---------------------------------------------------------------------------
+// Tracker states (semantic mapping)
+// ---------------------------------------------------------------------------
+
+const statesSchema = z.object({
+  /** New issue entry state (plan creation). */
+  planning: z.string(),
+  /** Waiting for Slack plan approval. */
+  plan_review: z.string(),
+  /** Implementation in progress. */
+  in_progress: z.string(),
+  /** PR review waiting for human. */
+  in_review: z.string(),
+  /** Completed. */
+  done: z.string(),
+  /** Canceled / duplicated (optional). */
+  canceled: z.string().optional(),
+});
+
+export type StatesConfig = z.infer<typeof statesSchema>;
+
+// ---------------------------------------------------------------------------
 // Tracker
 // ---------------------------------------------------------------------------
 
 const baseTrackerSchema = z.object({
-  active_states: z.array(z.string()).min(1, 'At least one active_state required'),
-  terminal_states: z.array(z.string()).min(1, 'At least one terminal_state required'),
+  states: statesSchema,
+  /** Override auto-derived active_states. If empty, derived from states. */
+  active_states: z.array(z.string()).default([]),
+  /** Override auto-derived terminal_states. If empty, derived from states. */
+  terminal_states: z.array(z.string()).default([]),
   /** How often to poll this tracker for candidate issues (ms). */
   poll_interval_ms: z.number().int().positive().default(30_000),
   assignee: z.string().optional(),
@@ -154,10 +208,17 @@ export type TriggerConfig = z.infer<typeof triggerSchema>;
 // Agent backends — discriminated union
 // ---------------------------------------------------------------------------
 
+const agentModelsSchema = z.object({
+  planning: z.string().default('opus'),
+  implementation: z.string().default('sonnet'),
+}).optional();
+
 const claudeAgentSchema = z.object({
   kind: z.literal('claude'),
   /** Path or name of the `claude` binary. */
   command: z.string().default('claude'),
+  /** Model selection per phase (planning vs implementation). */
+  models: agentModelsSchema,
   /** Maximum agent turns before returning control to the orchestrator. */
   max_turns: z.number().int().positive().default(20),
   /** Optional per-turn spending cap in USD. */
@@ -173,8 +234,8 @@ const claudeAgentSchema = z.object({
 
 const codexAgentSchema = z.object({
   kind: z.literal('codex'),
-  /** Full command string for the Codex app-server process. */
-  command: z.string().default('codex app-server'),
+  /** Path or name of the `codex` binary. */
+  command: z.string().default('codex'),
   /** Maximum agent turns before returning control to the orchestrator. */
   max_turns: z.number().int().positive().default(20),
   /** Codex approval policy (e.g. "never", "on-failure"). */
@@ -229,18 +290,6 @@ const dockerSchema = z.object({
   memory: z.string().optional(),
   cpus: z.string().optional(),
   env: z.record(z.string()).default({}),
-}).default({});
-
-// ---------------------------------------------------------------------------
-// Hooks
-// ---------------------------------------------------------------------------
-
-const hooksSchema = z.object({
-  after_create: z.string().nullable().optional(),
-  before_run: z.string().nullable().optional(),
-  after_run: z.string().nullable().optional(),
-  before_remove: z.string().nullable().optional(),
-  timeout_ms: z.number().int().positive().default(300_000),
 }).default({});
 
 // ---------------------------------------------------------------------------
@@ -304,7 +353,6 @@ const rawConfigSchema = z.object({
   worker: workerSchema,
   agent: agentSchema,
   docker: dockerSchema,
-  hooks: hooksSchema,
   observability: observabilitySchema,
   server: serverSchema,
   slack: slackSchema,
@@ -313,15 +361,25 @@ const rawConfigSchema = z.object({
 
 /** Fully-parsed, validated config with `trackers` and `agents` always populated. */
 export const configSchema = rawConfigSchema.transform((raw) => {
+  const trackers = raw.trackers.map((t) => {
+    const s = t.states;
+    const derivedActive = [s.planning, s.in_progress];
+    const derivedTerminal = [s.done, ...(s.canceled ? [s.canceled] : [])];
+    return {
+      ...t,
+      active_states: t.active_states.length > 0 ? t.active_states : derivedActive,
+      terminal_states: t.terminal_states.length > 0 ? t.terminal_states : derivedTerminal,
+    };
+  });
+
   return {
     workspace_backend: raw.workspace_backend,
-    trackers: raw.trackers,
+    trackers,
     agents: raw.agents,
     workspace: raw.workspace,
     worker: raw.worker,
     agent: raw.agent,
     docker: raw.docker,
-    hooks: raw.hooks,
     observability: raw.observability,
     server: raw.server,
     slack: raw.slack,

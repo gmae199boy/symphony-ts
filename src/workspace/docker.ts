@@ -19,7 +19,8 @@ import { issueCtx } from '../utils.js';
 import { shellEscape } from '../shell-utils.js';
 import { spawnAsync } from '../spawn-async.js';
 import type { Issue, WorkspaceRef, WorkspaceBackend } from '../types.js';
-import type { Config } from '../config/schema.js';
+import type { Config, RepositoryConfig } from '../config/schema.js';
+import { buildCloneUrl } from './clone-url.js';
 
 const WORKSPACE_PATH = '/workspace';
 const CONTAINER_PREFIX = 'symphony-';
@@ -38,10 +39,15 @@ const ENV_PASS_THROUGH = [
 
 export class DockerWorkspaceBackend implements WorkspaceBackend {
   private readonly config: Config;
+  private readonly repository?: RepositoryConfig;
 
-  constructor(config: Config) {
+  constructor(config: Config, repository?: RepositoryConfig) {
     this.config = config;
+    this.repository = repository;
   }
+
+  private get hooks() { return this.repository?.hooks; }
+  private get hookTimeoutMs() { return this.hooks?.timeout_ms ?? 300_000; }
 
   async create(issue: Issue, _workerHost?: string): Promise<WorkspaceRef> {
     const name = containerName(issue);
@@ -55,29 +61,29 @@ export class DockerWorkspaceBackend implements WorkspaceBackend {
   }
 
   async runBeforeRunHook(ref: WorkspaceRef, issue: Issue): Promise<void> {
-    const command = this.config.hooks.before_run;
+    const command = this.hooks?.before_run;
     if (!command || command.trim() === '') return;
     if (!ref.containerName) return;
 
-    await dockerExec(ref.containerName, command, this.config.hooks.timeout_ms);
+    await dockerExec(ref.containerName, command, this.hookTimeoutMs);
   }
 
   async runAfterRunHook(ref: WorkspaceRef, issue: Issue): Promise<void> {
-    const command = this.config.hooks.after_run;
+    const command = this.hooks?.after_run;
     if (!command || command.trim() === '') return;
     if (!ref.containerName) return;
 
-    await dockerExec(ref.containerName, command, this.config.hooks.timeout_ms);
+    await dockerExec(ref.containerName, command, this.hookTimeoutMs);
   }
 
   async cleanup(ref: WorkspaceRef, _issue: Issue): Promise<void> {
     const name = ref.containerName;
     if (!name) return;
 
-    const command = this.config.hooks.before_remove;
+    const command = this.hooks?.before_remove;
     if (command && command.trim() !== '') {
       try {
-        await dockerExec(name, command, this.config.hooks.timeout_ms);
+        await dockerExec(name, command, this.hookTimeoutMs);
       } catch (err) {
         logger.warn('before_remove hook failed', { container: name, error: String(err) });
       }
@@ -140,14 +146,22 @@ export class DockerWorkspaceBackend implements WorkspaceBackend {
     // Inject git credentials via credential.helper store (no token in git URLs).
     await injectGitCredentials(name);
 
-    // Run after_create hook
-    const afterCreate = this.config.hooks.after_create;
+    // after_create hook (runs after credentials, before clone — fatal on failure)
+    const afterCreate = this.hooks?.after_create;
     if (afterCreate && afterCreate.trim() !== '') {
       logger.info(`Running after_create hook in container ${name} for ${issueCtx(issue)}`);
-      try {
-        await dockerExec(name, afterCreate, this.config.hooks.timeout_ms);
-      } catch (err) {
-        logger.warn('after_create hook failed (non-fatal)', { container: name, error: String(err) });
+      await dockerExec(name, afterCreate, this.hookTimeoutMs);
+    }
+
+    // Auto-clone
+    if (this.repository) {
+      const cloneUrl = buildCloneUrl(this.repository);
+      logger.info(`Cloning ${cloneUrl} into container ${name}`);
+      await dockerExec(name, `git clone --depth 1 ${cloneUrl} .`, this.hookTimeoutMs);
+
+      // after_clone hook
+      if (this.hooks?.after_clone?.trim()) {
+        await dockerExec(name, this.hooks.after_clone, this.hookTimeoutMs);
       }
     }
 

@@ -92,6 +92,11 @@ export class JiraClient implements TrackerClient {
   private myAccountId: string | null | undefined = undefined;
 
   constructor(config: JiraTrackerConfig) {
+    const email = config.email ?? process.env['JIRA_EMAIL'];
+    const apiToken = config.api_token ?? process.env['JIRA_API_TOKEN'];
+    if (!email || !apiToken) {
+      throw new Error('Jira email and api_token must be configured');
+    }
     this.config = config;
     // Remove trailing slash from host
     this.baseUrl = config.host.replace(/\/+$/, '');

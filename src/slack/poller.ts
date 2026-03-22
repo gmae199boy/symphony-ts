@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import { logger } from '../logger.js';
+import { Poller } from '../poller.js';
 import { fetchWithRetry } from '../fetch-retry.js';
 import type { SlackConfig } from '../config/schema.js';
 
@@ -127,14 +128,12 @@ class SlackThreadStore {
 // SlackPoller
 // ---------------------------------------------------------------------------
 
-export class SlackPoller {
+export class SlackPoller extends Poller {
   private readonly botToken: string;
-  private readonly pollIntervalMs: number;
   private readonly onEvent: (event: SlackResponseEvent) => void;
   private readonly store: SlackThreadStore;
 
   private watched = new Map<string, WatchedThread>(); // issueIdentifier → thread
-  private timer: NodeJS.Timeout | null = null;
   private botUserId: string | null = null;
 
   constructor(
@@ -142,29 +141,20 @@ export class SlackPoller {
     workspaceRoot: string,
     onEvent: (event: SlackResponseEvent) => void,
   ) {
+    super(config.poll_interval_ms);
     this.botToken = config.bot_token;
-    this.pollIntervalMs = config.poll_interval_ms;
     this.onEvent = onEvent;
     this.store = new SlackThreadStore(workspaceRoot);
   }
 
-  async start(): Promise<void> {
-    if (this.timer) return;
-
+  override async start(): Promise<void> {
     await this.fetchBotUserId();
     this.restoreFromStore();
 
     logger.info('Slack poller starting', {
       restoredThreads: this.watched.size,
     });
-    this.scheduleNext(0);
-  }
-
-  stop(): void {
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
+    super.start();
   }
 
   watch(
@@ -239,25 +229,19 @@ export class SlackPoller {
   // ---------------------------------------------------------------------------
 
   private async fetchBotUserId(): Promise<void> {
-    try {
-      const resp = await fetchWithRetry('https://slack.com/api/auth.test', {
-        headers: { Authorization: `Bearer ${this.botToken}` },
-      });
-      const parsed = SlackAuthTestResponseSchema.safeParse(await resp.json());
-      if (!parsed.success) {
-        logger.warn('Slack auth.test: unexpected response shape', { error: parsed.error.message });
-        return;
-      }
-      const data = parsed.data;
-      if (data.ok && data.user_id) {
-        this.botUserId = data.user_id;
-        logger.info('Slack poller: resolved bot user ID', { botUserId: this.botUserId });
-      } else {
-        logger.warn('Slack poller: auth.test failed', { error: data.error });
-      }
-    } catch (err) {
-      logger.warn('Slack poller: failed to fetch bot user ID', { error: String(err) });
+    const resp = await fetchWithRetry('https://slack.com/api/auth.test', {
+      headers: { Authorization: `Bearer ${this.botToken}` },
+    });
+    const parsed = SlackAuthTestResponseSchema.safeParse(await resp.json());
+    if (!parsed.success) {
+      throw new Error(`Slack auth.test: unexpected response shape: ${parsed.error.message}`);
     }
+    const data = parsed.data;
+    if (!data.ok || !data.user_id) {
+      throw new Error(`Slack auth.test failed: ${data.error ?? 'unknown error'}`);
+    }
+    this.botUserId = data.user_id;
+    logger.info('Slack poller: resolved bot user ID', { botUserId: this.botUserId });
   }
 
   // ---------------------------------------------------------------------------
@@ -303,29 +287,10 @@ export class SlackPoller {
   }
 
   // ---------------------------------------------------------------------------
-  // Scheduling
-  // ---------------------------------------------------------------------------
-
-  private scheduleNext(delayMs: number): void {
-    if (this.timer) clearTimeout(this.timer);
-    this.timer = setTimeout(() => this.poll(), delayMs);
-  }
-
-  private async poll(): Promise<void> {
-    try {
-      await this.doPoll();
-    } catch (err) {
-      logger.warn('Slack poller: poll failed', { error: String(err) });
-    } finally {
-      this.scheduleNext(this.pollIntervalMs);
-    }
-  }
-
-  // ---------------------------------------------------------------------------
   // Core poll logic
   // ---------------------------------------------------------------------------
 
-  private async doPoll(): Promise<void> {
+  protected override async doPoll(): Promise<void> {
     for (const [identifier, watched] of this.watched) {
       try {
         await this.checkThread(watched);

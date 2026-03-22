@@ -4,13 +4,15 @@
  */
 
 import { Liquid } from 'liquidjs';
-import type { Issue } from './types.js';
+import type { Issue, DispatchReason } from './types.js';
+import type { StatesConfig } from './config/schema.js';
 
 const engine = new Liquid({ strictVariables: false, strictFilters: false });
 
 export interface PromptExtras {
   trackerKind?: string;
   repositoryKind?: string;
+  states?: StatesConfig;
 }
 
 /**
@@ -32,6 +34,7 @@ export async function buildPrompt(
     attempt: attempt > 1 ? attempt : null,
     tracker_kind: extras?.trackerKind ?? 'tracker',
     repository_kind: extras?.repositoryKind ?? 'github',
+    states: extras?.states ?? {},
   };
 
   return engine.parseAndRender(template, context);
@@ -51,6 +54,38 @@ export function buildContinuationPrompt(turnNumber: number, maxTurns: number, tr
 - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
 - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
 `;
+}
+
+/**
+ * Returns a resume prompt tailored to the dispatch reason.
+ */
+export function buildResumePrompt(
+  reason: DispatchReason | undefined,
+  turnNumber: number,
+  maxTurns: number,
+  trackerKind?: string,
+): string {
+  const tracker = trackerKind ?? 'tracker';
+
+  if (reason === 'pr_feedback') {
+    return `Resume guidance:
+
+- New PR feedback has arrived. Check .symphony/pr_feedback.json for the latest review comments.
+- Address the feedback, update the code, and push the changes.
+- This is continuation turn #${turnNumber} of ${maxTurns}.
+`;
+  }
+
+  if (reason === 'slack_response') {
+    return `Resume guidance:
+
+- A Slack response has been received. Check .symphony/slack_response.json for the user's message.
+- Follow the user's instructions or answer their question, then continue working on the ${tracker} issue.
+- This is continuation turn #${turnNumber} of ${maxTurns}.
+`;
+  }
+
+  return buildContinuationPrompt(turnNumber, maxTurns, trackerKind);
 }
 
 // ---------------------------------------------------------------------------

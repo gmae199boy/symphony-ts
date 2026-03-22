@@ -83,6 +83,10 @@ export class BitbucketClient {
   private readonly config: BitbucketRepositoryConfig;
 
   constructor(config: BitbucketRepositoryConfig) {
+    const apiToken = config.api_token ?? process.env['BITBUCKET_API_TOKEN'];
+    if (!apiToken) {
+      throw new Error('Bitbucket api_token is required');
+    }
     this.config = config;
   }
 

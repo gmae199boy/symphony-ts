@@ -215,6 +215,9 @@ export class LinearClient implements TrackerClient {
   private assigneeFilter: AssigneeFilter | null | undefined = undefined;
 
   constructor(config: LinearTrackerConfig) {
+    if (!config.api_key) {
+      throw new Error('Linear api_key is required but not configured');
+    }
     this.config = config;
     this.endpoint = config.endpoint ?? 'https://api.linear.app/graphql';
   }
