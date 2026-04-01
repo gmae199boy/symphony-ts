@@ -70,9 +70,11 @@ export class RepoPoller extends Poller {
     }
 
     const label = this.config.kind === 'github' ? this.config.repo : `${this.config.workspace}/${this.config.repo_slug}`;
-    logger.info(
-      `Repository poller: found ${prs.length} tracked PR(s) in ${label}${this.state.firstPoll ? ' (first poll)' : ''}`,
-    );
+    if (prs.length > 0 || this.state.firstPoll) {
+      logger.debug(
+        `Repository poller: found ${prs.length} tracked PR(s) in ${label}${this.state.firstPoll ? ' (first poll)' : ''}`,
+      );
+    }
 
     // Detect PRs that disappeared from the open list (potentially merged)
     if (!this.state.firstPoll) {
@@ -179,9 +181,15 @@ export class RepoPoller extends Poller {
     return updated;
   }
 
-  private handleFirstPollComments(_pr: PullRequest, _comments: Comment[]): void {
-    // On true first poll (no persisted state), seed all comments as "seen"
-    // without emitting events. New comments will be detected from the next cycle.
+  private handleFirstPollComments(pr: PullRequest, comments: Comment[]): void {
+    // Seed all comments as "seen", but if the most recent comment is from
+    // a non-bot user, emit a new_comments event so it gets processed.
+    if (comments.length === 0) return;
+
+    const last = comments[comments.length - 1];
+    if (last && !last.isBot) {
+      this.emitEvent({ kind: 'new_comments', pr, comments: [last] });
+    }
   }
 
   // ---------------------------------------------------------------------------

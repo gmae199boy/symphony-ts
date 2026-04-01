@@ -10,7 +10,7 @@ import { z } from 'zod';
 import { logger } from '../logger.js';
 import { fetchWithRetry, sleep } from '../fetch-retry.js';
 import { parseDate } from '../utils.js';
-import type { Issue, BlockerRef, TrackerClient } from '../types.js';
+import type { Issue, BlockerRef, TrackerClient, TrackerComment } from '../types.js';
 import type { LinearTrackerConfig } from '../config/schema.js';
 
 const ISSUE_PAGE_SIZE = 50;
@@ -27,7 +27,7 @@ query SymphonyLinearPoll($projectSlug: String!, $stateNames: [String!]!, $first:
       id identifier title description priority
       state { name }
       branchName url
-      assignee { id }
+      assignee { id email }
       labels { nodes { name } }
       inverseRelations(first: $relationFirst) {
         nodes {
@@ -48,7 +48,7 @@ query SymphonyLinearIssuesById($ids: [ID!]!, $first: Int!, $relationFirst: Int!)
       id identifier title description priority
       state { name }
       branchName url
-      assignee { id }
+      assignee { id email }
       labels { nodes { name } }
       inverseRelations(first: $relationFirst) {
         nodes {
@@ -67,7 +67,7 @@ query SymphonyLinearIssueByIdentifier($identifier: String!, $relationFirst: Int!
     id identifier title description priority
     state { name }
     branchName url
-    assignee { id }
+    assignee { id email }
     labels { nodes { name } }
     inverseRelations(first: $relationFirst) {
       nodes {
@@ -102,6 +102,21 @@ query SymphonyLinearViewer {
   viewer { id }
 }`;
 
+const ISSUE_COMMENTS_QUERY = `
+query SymphonyLinearIssueComments($issueId: String!, $first: Int!) {
+  issue(id: $issueId) {
+    comments(first: $first, orderBy: createdAt) {
+      nodes {
+        id
+        body
+        user { id email }
+        botActor { id }
+        createdAt
+      }
+    }
+  }
+}`;
+
 // ---------------------------------------------------------------------------
 // Zod schemas for API responses
 // ---------------------------------------------------------------------------
@@ -126,7 +141,7 @@ const IssueNodeSchema = z.object({
   state: z.object({ name: z.string() }).nullable().optional(),
   branchName: z.string().nullable().optional(),
   url: z.string(),
-  assignee: z.object({ id: z.string() }).nullable().optional(),
+  assignee: z.object({ id: z.string(), email: z.string().optional() }).nullable().optional(),
   labels: z.object({
     nodes: z.array(z.object({ name: z.string() })),
   }).optional(),
@@ -163,6 +178,22 @@ const ByIdentifierResponseSchema = z.object({
 
 const ViewerResponseSchema = z.object({
   viewer: z.object({ id: z.string() }).nullable(),
+});
+
+const LinearCommentNodeSchema = z.object({
+  id: z.string(),
+  body: z.string(),
+  user: z.object({ id: z.string(), email: z.string().optional() }).nullable().optional(),
+  botActor: z.object({ id: z.string() }).nullable().optional(),
+  createdAt: z.string().nullable().optional(),
+});
+
+const IssueCommentsResponseSchema = z.object({
+  issue: z.object({
+    comments: z.object({
+      nodes: z.array(LinearCommentNodeSchema),
+    }),
+  }).nullable(),
 });
 
 const ResolveStateIdResponseSchema = z.object({
@@ -275,6 +306,39 @@ export class LinearClient implements TrackerClient {
     }
 
     logger.info(`Linear: transitioned issue ${id} to "${toState}"`);
+  }
+
+  async fetchComments(issueId: string, since?: Date): Promise<TrackerComment[]> {
+    const raw = await this.rawGraphql(ISSUE_COMMENTS_QUERY, { issueId, first: 100 });
+    const data = IssueCommentsResponseSchema.parse(raw);
+    const nodes = data.issue?.comments.nodes ?? [];
+    const botId = await this.getBotIdentity();
+
+    return nodes
+      .filter((n) => {
+        if (!since) return true;
+        const createdAt = parseDate(n.createdAt ?? null);
+        return createdAt !== null && createdAt > since;
+      })
+      .map((n) => ({
+        id: n.id,
+        body: n.body,
+        authorId: n.user?.id ?? n.botActor?.id ?? '',
+        authorEmail: n.user?.email,
+        isBot: n.botActor !== null && n.botActor !== undefined,
+        createdAt: parseDate(n.createdAt ?? null),
+      }))
+      .filter((c) => c.authorId !== '' && !(botId && c.authorId === botId));
+  }
+
+  async getBotIdentity(): Promise<string | null> {
+    try {
+      const raw = await this.rawGraphql(VIEWER_QUERY, {});
+      const data = ViewerResponseSchema.parse(raw);
+      return data.viewer?.id ?? null;
+    } catch {
+      return null;
+    }
   }
 
   async createComment(id: string, body: string): Promise<void> {
@@ -473,6 +537,7 @@ function normalizeIssue(node: IssueNode, filter: AssigneeFilter | null): Issue |
     branchName: node.branchName ?? null,
     url: node.url,
     assigneeId: node.assignee?.id ?? null,
+    assigneeEmail: node.assignee?.email ?? null,
     labels: extractLabels(node),
     blockedBy: extractBlockers(node),
     assignedToWorker: true,

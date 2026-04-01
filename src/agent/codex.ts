@@ -41,10 +41,12 @@ export class CodexBackend implements AgentBackend {
 
   async run(
     workspace: string,
-    prompt: string,
     issue: Issue,
     opts: AgentRunOpts,
   ): Promise<AgentRunResult> {
+    const prompt = opts.resumeMessage
+      ? `${opts.workflow}\n\n---\n\n## Current instruction\n\n${opts.resumeMessage}`
+      : opts.workflow;
     const timeoutMs = opts.timeoutMs ?? 3_600_000;
 
     logger.info(

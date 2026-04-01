@@ -1,5 +1,5 @@
 /**
- * SSH workspace I/O — stub for future SSH remote execution support.
+ * SSH 워크스페이스 I/O — 향후 SSH 원격 실행 지원을 위한 스텁입니다.
  */
 
 import type { Issue, WorkspaceRef, WorkspaceIO } from '../types.js';
@@ -11,7 +11,7 @@ export class SshWorkspaceIO implements WorkspaceIO {
   writeFile(_ref: WorkspaceRef, _relativePath: string, _content: string): Promise<void> {
     throw new Error('SSH workspace IO not yet implemented');
   }
-  getDiff(_ref: WorkspaceRef): Promise<string | null> {
+  getDiff(_ref: WorkspaceRef, _base?: string): Promise<string | null> {
     throw new Error('SSH workspace IO not yet implemented');
   }
   exists(_ref: WorkspaceRef): Promise<boolean> {

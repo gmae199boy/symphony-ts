@@ -22,6 +22,12 @@ curl -s -X POST https://api.linear.app/graphql \
   -H "Authorization: $LINEAR_API_KEY" \
   -d '{"query": "mutation { issueUpdate(id: \"issue-uuid\", input: { stateId: \"state-uuid\" }) { success } }"}'
 
+# List all comments on an issue (to find existing workpad)
+curl -s -X POST https://api.linear.app/graphql \
+  -H "Content-Type: application/json" \
+  -H "Authorization: $LINEAR_API_KEY" \
+  -d '{"query": "{ issue(id: \"issue-uuid\") { comments { nodes { id body createdAt } } } }"}'
+
 # Create a comment
 curl -s -X POST https://api.linear.app/graphql \
   -H "Content-Type: application/json" \
@@ -43,6 +49,8 @@ curl -s -X POST https://api.linear.app/graphql \
 
 ## Notes
 
+- Do NOT fetch issue fields from Linear. All issue context (title, description, status, labels) is provided in the prompt.
+- You MAY fetch issue comments to find the existing workpad (`## Agent Workpad`).
 - Linear uses workflow state IDs (UUIDs), not state names, for mutations.
 - To transition an issue, first resolve the state name → state ID via the issue's team.
 - Use the `branchName` field from issues for Git operations.

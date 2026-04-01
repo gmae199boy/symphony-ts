@@ -1,10 +1,10 @@
 /**
- * Prompt builder — renders the Liquid template from WORKFLOW.md with issue context.
- * Mirrors elixir/lib/symphony_elixir/prompt_builder.ex
+ * 프롬프트 빌더 — WORKFLOW.md의 Liquid 템플릿을 이슈 컨텍스트와 함께 렌더링합니다.
+ * elixir/lib/symphony_elixir/prompt_builder.ex 를 미러링합니다.
  */
 
 import { Liquid } from 'liquidjs';
-import type { Issue, DispatchReason } from './types.js';
+import type { Issue } from './types.js';
 import type { StatesConfig } from './config/schema.js';
 
 const engine = new Liquid({ strictVariables: false, strictFilters: false });
@@ -13,15 +13,16 @@ export interface PromptExtras {
   trackerKind?: string;
   repositoryKind?: string;
   states?: StatesConfig;
+  prFeedbackSource?: string;
 }
 
 /**
- * Render the Liquid prompt template with issue data.
+ * 이슈 데이터와 함께 Liquid 프롬프트 템플릿을 렌더링합니다.
  *
- * @param template  The Liquid template string from WORKFLOW.md
- * @param issue     The issue to render for
- * @param attempt   Turn number (1 = first turn, >1 = continuation)
- * @param extras    Additional template variables (tracker_kind, repository_kind)
+ * @param template  WORKFLOW.md에서 가져온 Liquid 템플릿 문자열
+ * @param issue     렌더링할 이슈
+ * @param attempt   턴 번호 (1 = 첫 번째 턴, >1 = 이어서 실행)
+ * @param extras    추가 템플릿 변수 (tracker_kind, repository_kind)
  */
 export async function buildPrompt(
   template: string,
@@ -35,61 +36,14 @@ export async function buildPrompt(
     tracker_kind: extras?.trackerKind ?? 'tracker',
     repository_kind: extras?.repositoryKind ?? 'github',
     states: extras?.states ?? {},
+    pr_feedback_source: extras?.prFeedbackSource ?? 'pr',
   };
 
   return engine.parseAndRender(template, context);
 }
 
-/**
- * Returns the standard continuation prompt for turns > 1 when no custom
- * template continuation logic is present.
- */
-export function buildContinuationPrompt(turnNumber: number, maxTurns: number, trackerKind?: string): string {
-  const tracker = trackerKind ?? 'tracker';
-  return `Continuation guidance:
-
-- The previous agent turn completed normally, but the ${tracker} issue is still in an active state.
-- This is continuation turn #${turnNumber} of ${maxTurns} for the current agent run.
-- Resume from the current workspace and workpad state instead of restarting from scratch.
-- The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
-- Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
-`;
-}
-
-/**
- * Returns a resume prompt tailored to the dispatch reason.
- */
-export function buildResumePrompt(
-  reason: DispatchReason | undefined,
-  turnNumber: number,
-  maxTurns: number,
-  trackerKind?: string,
-): string {
-  const tracker = trackerKind ?? 'tracker';
-
-  if (reason === 'pr_feedback') {
-    return `Resume guidance:
-
-- New PR feedback has arrived. Check .symphony/pr_feedback.json for the latest review comments.
-- Address the feedback, update the code, and push the changes.
-- This is continuation turn #${turnNumber} of ${maxTurns}.
-`;
-  }
-
-  if (reason === 'slack_response') {
-    return `Resume guidance:
-
-- A Slack response has been received. Check .symphony/slack_response.json for the user's message.
-- Follow the user's instructions or answer their question, then continue working on the ${tracker} issue.
-- This is continuation turn #${turnNumber} of ${maxTurns}.
-`;
-  }
-
-  return buildContinuationPrompt(turnNumber, maxTurns, trackerKind);
-}
-
 // ---------------------------------------------------------------------------
-// Helpers
+// 헬퍼
 // ---------------------------------------------------------------------------
 
 function issueToTemplateContext(issue: Issue): Record<string, unknown> {
@@ -103,6 +57,7 @@ function issueToTemplateContext(issue: Issue): Record<string, unknown> {
     branch_name: issue.branchName,
     url: issue.url,
     assignee_id: issue.assigneeId,
+    assignee_email: issue.assigneeEmail,
     labels: issue.labels.join(', '),
     created_at: issue.createdAt?.toISOString() ?? null,
     updated_at: issue.updatedAt?.toISOString() ?? null,

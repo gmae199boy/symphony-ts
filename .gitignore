@@ -25,3 +25,7 @@ Thumbs.db
 
 # Runtime
 symphony-workspaces/
+logs/
+
+# Remote sync config (contains SSH key path and server IP)
+.sync.env

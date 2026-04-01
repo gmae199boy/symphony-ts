@@ -1,5 +1,5 @@
 /**
- * Local workspace I/O — reads/writes files on the host filesystem.
+ * 로컬 워크스페이스 I/O — 호스트 파일시스템의 파일을 읽고 씁니다.
  */
 
 import fs from 'node:fs';
@@ -30,8 +30,9 @@ export class LocalWorkspaceIO implements WorkspaceIO {
     await fs.promises.writeFile(fullPath, content, 'utf8');
   }
 
-  async getDiff(ref: WorkspaceRef): Promise<string | null> {
-    const proc = await spawnAsync('git', ['diff', 'HEAD~1'], {
+  async getDiff(ref: WorkspaceRef, base?: string): Promise<string | null> {
+    const range = base ? `${base}..HEAD` : 'origin/main...HEAD';
+    const proc = await spawnAsync('git', ['diff', range], {
       cwd: ref.workspace,
       timeoutMs: 30_000,
     });

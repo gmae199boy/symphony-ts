@@ -1,7 +1,7 @@
 /**
- * Zod configuration schema — mirrors elixir/lib/symphony_elixir/config/schema.ex
+ * Zod 설정 스키마 — elixir/lib/symphony_elixir/config/schema.ex 를 미러링
  *
- * WORKFLOW.md format:
+ * WORKFLOW.md 형식:
  *
  *   trackers:
  *     - kind: linear
@@ -31,26 +31,32 @@
  *           timeout_ms: 300000
  *
  *   agents:
- *     - kind: claude
- *       models:
- *         planning: opus
- *         implementation: sonnet
- *       max_turns: 20
- *     - kind: codex
- *       trigger:
- *         pr_labels: [security]
+ *     max_concurrent: 10
+ *     review:
+ *       rounds: 2
+ *       kinds:
+ *         - claude
+ *     backends:
+ *       - kind: claude
+ *         primary: true
+ *         models:
+ *           planning: opus
+ *           implementation: sonnet
+ *       - kind: codex
+ *         trigger:
+ *           pr_labels: [security]
  *
- * For backwards compatibility a top-level `tracker:` (single object) is also
- * accepted and normalised into a one-element `trackers` array.
+ * 하위 호환성을 위해 최상위 `tracker:` (단일 객체) 형식도 허용하며,
+ * 단일 요소 `trackers` 배열로 정규화됩니다.
  */
 
 import { z } from 'zod';
 
 // ---------------------------------------------------------------------------
-// Helpers
+// 헬퍼
 // ---------------------------------------------------------------------------
 
-/** Resolve "$ENV_VAR" tokens from the environment. */
+/** 환경 변수에서 "$ENV_VAR" 토큰을 해석합니다. */
 function resolveEnv(value: string): string {
   return value.replace(/\$([A-Z0-9_]+)/g, (_match, name: string) => {
     const val = process.env[name];
@@ -61,7 +67,7 @@ function resolveEnv(value: string): string {
   });
 }
 
-/** Zod preprocessor: resolve env vars in string fields. */
+/** Zod 전처리기: 문자열 필드의 환경 변수를 해석합니다. */
 const envString = z.preprocess(
   (v) => (typeof v === 'string' ? resolveEnv(v) : v),
   z.string(),
@@ -73,7 +79,7 @@ const optionalEnvString = z.preprocess(
 );
 
 // ---------------------------------------------------------------------------
-// Repository hooks
+// 저장소 훅
 // ---------------------------------------------------------------------------
 
 const repositoryHooksSchema = z.object({
@@ -86,7 +92,7 @@ const repositoryHooksSchema = z.object({
 }).default({});
 
 // ---------------------------------------------------------------------------
-// Repository (GitHub / Bitbucket)
+// 저장소 (GitHub / Bitbucket)
 // ---------------------------------------------------------------------------
 
 const githubRepositorySchema = z.object({
@@ -104,7 +110,7 @@ const bitbucketRepositorySchema = z.object({
   kind: z.literal('bitbucket'),
   workspace: envString,
   repo_slug: envString,
-  /** Bitbucket API 토큰(개인) 사용 시 필수 — Basic(이메일:토큰) 인증. 워크스페이스 토큰만 쓰면 생략 가능. */
+  /** Bitbucket 개인 API 토큰 사용 시 필수 — Basic(이메일:토큰) 인증. 워크스페이스 토큰만 사용할 경우 생략 가능. */
   email: optionalEnvString,
   api_token: optionalEnvString,
   poll_interval_ms: z.number().int().positive().default(30_000),
@@ -114,9 +120,16 @@ const bitbucketRepositorySchema = z.object({
   hooks: repositoryHooksSchema,
 });
 
+const baseRepositoryExtensions = {
+  /** 이 저장소에 매핑되는 이슈 레이블. 다중 저장소 설정에서 사용합니다. */
+  issue_labels: z.array(z.string()).default([]),
+  /** 레이블 일치 항목이 없을 때 이 저장소를 사용합니다 (다중 저장소 폴백). */
+  default: z.boolean().default(false),
+};
+
 export const repositorySchema = z.discriminatedUnion('kind', [
-  githubRepositorySchema,
-  bitbucketRepositorySchema,
+  githubRepositorySchema.extend(baseRepositoryExtensions),
+  bitbucketRepositorySchema.extend(baseRepositoryExtensions),
 ]);
 
 export type RepositoryConfig = z.infer<typeof repositorySchema>;
@@ -124,41 +137,43 @@ export type GitHubRepositoryConfig = z.infer<typeof githubRepositorySchema>;
 export type BitbucketRepositoryConfig = z.infer<typeof bitbucketRepositorySchema>;
 
 // ---------------------------------------------------------------------------
-// Tracker states (semantic mapping)
+// 트래커 상태 (시맨틱 매핑)
 // ---------------------------------------------------------------------------
 
 const statesSchema = z.object({
-  /** New issue entry state (plan creation). */
+  /** 새 이슈 진입 상태 (계획 생성). */
   planning: z.string(),
-  /** Waiting for Slack plan approval. */
+  /** Slack 계획 승인 대기 중. */
   plan_review: z.string(),
-  /** Implementation in progress. */
+  /** 구현 진행 중. */
   in_progress: z.string(),
-  /** PR review waiting for human. */
+  /** 사람의 PR 리뷰 대기 중. */
   in_review: z.string(),
-  /** Completed. */
+  /** 완료됨. */
   done: z.string(),
-  /** Canceled / duplicated (optional). */
+  /** 취소됨 / 중복됨 (선택 사항). */
   canceled: z.string().optional(),
 });
 
 export type StatesConfig = z.infer<typeof statesSchema>;
 
 // ---------------------------------------------------------------------------
-// Tracker
+// 트래커
 // ---------------------------------------------------------------------------
 
 const baseTrackerSchema = z.object({
   states: statesSchema,
-  /** Override auto-derived active_states. If empty, derived from states. */
+  /** 자동 파생된 active_states를 재정의합니다. 비어 있으면 states에서 파생됩니다. */
   active_states: z.array(z.string()).default([]),
-  /** Override auto-derived terminal_states. If empty, derived from states. */
+  /** 자동 파생된 terminal_states를 재정의합니다. 비어 있으면 states에서 파생됩니다. */
   terminal_states: z.array(z.string()).default([]),
-  /** How often to poll this tracker for candidate issues (ms). */
+  /** 이 트래커에서 후보 이슈를 폴링하는 주기 (ms). */
   poll_interval_ms: z.number().int().positive().default(30_000),
   assignee: z.string().optional(),
   endpoint: z.string().url().optional(),
   repository: repositorySchema.optional(),
+  /** 이 트래커에 연결된 다중 저장소. 설정 시 `repository`를 덮어씁니다. */
+  repositories: z.array(repositorySchema).optional(),
 });
 
 const linearTrackerSchema = baseTrackerSchema.extend({
@@ -185,27 +200,32 @@ export type LinearTrackerConfig = z.infer<typeof linearTrackerSchema>;
 export type JiraTrackerConfig = z.infer<typeof jiraTrackerSchema>;
 
 // ---------------------------------------------------------------------------
-// Agent trigger conditions
+// 에이전트 트리거 조건
 // ---------------------------------------------------------------------------
 
 const triggerSchema = z.object({
   /**
-   * Run this agent only if the issue has at least one of these labels.
-   * If omitted, the issue label is not checked.
+   * 이슈에 이 레이블 중 하나 이상이 있을 때만 이 에이전트를 실행합니다.
+   * 생략 시 이슈 레이블을 확인하지 않습니다.
    */
   issue_labels: z.array(z.string()).optional(),
   /**
-   * Run this agent only if the PR that triggered the dispatch has at least
-   * one of these labels.  Ignored when dispatch is not PR-triggered.
-   * If omitted, the PR label is not checked.
+   * 디스패치를 트리거한 PR에 이 레이블 중 하나 이상이 있을 때만 이 에이전트를 실행합니다.
+   * PR 트리거가 아닌 경우 무시됩니다.
+   * 생략 시 PR 레이블을 확인하지 않습니다.
    */
   pr_labels: z.array(z.string()).optional(),
+  /**
+   * 이슈 담당자의 이메일이 이 목록 중 하나와 일치할 때만 이 에이전트를 실행합니다.
+   * 생략 시 담당자를 확인하지 않습니다.
+   */
+  assignees: z.array(z.string()).optional(),
 }).optional();
 
 export type TriggerConfig = z.infer<typeof triggerSchema>;
 
 // ---------------------------------------------------------------------------
-// Agent backends — discriminated union
+// 에이전트 백엔드 — 판별 유니온
 // ---------------------------------------------------------------------------
 
 const agentModelsSchema = z.object({
@@ -215,30 +235,36 @@ const agentModelsSchema = z.object({
 
 const claudeAgentSchema = z.object({
   kind: z.literal('claude'),
-  /** Path or name of the `claude` binary. */
+  /** 이 에이전트를 주 에이전트로 지정합니다 (계획/구현/리뷰 통합). 미설정 시 첫 번째 에이전트가 기본값. */
+  primary: z.boolean().optional(),
+  /** `claude` 바이너리의 경로 또는 이름. */
   command: z.string().default('claude'),
-  /** Model selection per phase (planning vs implementation). */
+  /** 단계별 모델 선택 (계획 vs 구현). */
   models: agentModelsSchema,
-  /** Maximum agent turns before returning control to the orchestrator. */
-  max_turns: z.number().int().positive().default(20),
-  /** Optional per-turn spending cap in USD. */
+  /** 최대 에이전트 턴 수 (CLI --max-turns에 전달). 생략 시 무제한 (Claude CLI 기본값). */
+  max_turns: z.number().int().positive().optional(),
+  /** 턴당 선택적 지출 한도 (USD). */
   max_budget_usd: z.number().positive().optional(),
-  /** Path to an MCP server config JSON file. */
+  /** MCP 서버 설정 JSON 파일 경로. */
   mcp_config: z.string().optional(),
-  /** Restrict which tools Claude may use (empty = all tools allowed). */
+  /** Claude가 사용할 수 있는 도구를 제한합니다 (비어 있으면 모든 도구 허용). */
   allowed_tools: z.array(z.string()).default([]),
-  /** Per-turn wall-clock timeout in milliseconds. */
+  /** 턴당 실제 시간 타임아웃 (밀리초). */
   turn_timeout_ms: z.number().int().positive().default(3_600_000),
+  /** Claude Code 인증/세션 파일이 있는 호스트 디렉터리. 기본 자격 증명 주입을 재정의합니다. */
+  claude_auth_dir: z.string().optional(),
   trigger: triggerSchema,
 });
 
 const codexAgentSchema = z.object({
   kind: z.literal('codex'),
-  /** Path or name of the `codex` binary. */
+  /** 이 에이전트를 주 에이전트로 지정합니다 (계획/구현/리뷰 통합). 미설정 시 첫 번째 에이전트가 기본값. */
+  primary: z.boolean().optional(),
+  /** `codex` 바이너리의 경로 또는 이름. */
   command: z.string().default('codex'),
-  /** Maximum agent turns before returning control to the orchestrator. */
+  /** 오케스트레이터에 제어를 반환하기 전 최대 에이전트 턴 수. */
   max_turns: z.number().int().positive().default(20),
-  /** Codex approval policy (e.g. "never", "on-failure"). */
+  /** Codex 승인 정책 (예: "never", "on-failure"). */
   approval_policy: z.string().default('never'),
   thread_sandbox: z.string().optional(),
   turn_sandbox_policy: z.record(z.unknown()).optional(),
@@ -255,7 +281,7 @@ export type CodexAgentConfig = z.infer<typeof codexAgentSchema>;
 export type AgentConfig = z.infer<typeof agentConfigSchema>;
 
 // ---------------------------------------------------------------------------
-// Workspace
+// 워크스페이스
 // ---------------------------------------------------------------------------
 
 const workspaceSchema = z.object({
@@ -263,7 +289,7 @@ const workspaceSchema = z.object({
 }).default({});
 
 // ---------------------------------------------------------------------------
-// Worker (SSH)
+// 워커 (SSH)
 // ---------------------------------------------------------------------------
 
 const workerSchema = z.object({
@@ -271,17 +297,7 @@ const workerSchema = z.object({
 }).default({});
 
 // ---------------------------------------------------------------------------
-// Agent (concurrency + retry settings; per-agent turn limits live in AgentConfig)
-// ---------------------------------------------------------------------------
-
-const agentSchema = z.object({
-  max_concurrent_agents: z.number().int().positive().default(10),
-  retry_backoff_ms: z.number().int().positive().default(5_000),
-  max_retries: z.number().int().min(0).default(2),
-}).default({});
-
-// ---------------------------------------------------------------------------
-// Docker workspace backend
+// Docker 워크스페이스 백엔드
 // ---------------------------------------------------------------------------
 
 const dockerSchema = z.object({
@@ -293,16 +309,15 @@ const dockerSchema = z.object({
 }).default({});
 
 // ---------------------------------------------------------------------------
-// Observability / Dashboard
+// 관측 가능성 / 대시보드
 // ---------------------------------------------------------------------------
 
 const observabilitySchema = z.object({
-  dashboard: z.boolean().default(true),
   refresh_interval_ms: z.number().int().positive().default(2_000),
 }).default({});
 
 // ---------------------------------------------------------------------------
-// Server
+// 서버
 // ---------------------------------------------------------------------------
 
 const serverSchema = z.object({
@@ -311,64 +326,84 @@ const serverSchema = z.object({
 }).default({});
 
 // ---------------------------------------------------------------------------
-// Slack (plan approval workflow)
+// Slack (계획 승인 워크플로)
 // ---------------------------------------------------------------------------
 
 const slackSchema = z.object({
   bot_token: envString,
+  app_token: envString,   // 앱 레벨 토큰 (xapp-...) — Socket Mode 연결에 필요
   channel: envString,
-  poll_interval_ms: z.number().int().positive().default(10_000),
 }).optional();
 
 export type SlackConfig = z.infer<typeof slackSchema>;
 
 // ---------------------------------------------------------------------------
-// Self-review (multi-agent code review before PR creation)
+// 에이전트 (통합: 백엔드 + 동시성 + 리뷰)
 // ---------------------------------------------------------------------------
 
 const reviewSchema = z.object({
-  /** Number of review rounds per agent. */
+  /** 에이전트당 리뷰 라운드 수. */
   rounds: z.number().int().min(1).max(5).default(2),
-  /** Agent kinds to use for review (run in parallel). */
-  agents: z.array(z.string()).min(1),
-  /** Agent kind used to validate/merge/dedup findings from all agents. */
-  validator: z.string(),
-  /** Agent kind used to execute the approved fixes. */
-  fix_agent: z.string(),
+  /** 리뷰 세션을 실행할 에이전트 백엔드 종류 (병렬 실행). backends[].kind와 일치해야 합니다. */
+  kinds: z.array(z.string()).min(1).default(['claude']),
+});
+
+const agentsSchema = z.object({
+  /** 동시에 실행할 수 있는 최대 에이전트 수. */
+  max_concurrent: z.number().int().positive().default(10),
+  /** 재시도 간 지연 시간 (ms). */
+  retry_backoff_ms: z.number().int().positive().default(5_000),
+  /** 이슈당 최대 재시도 횟수. */
+  max_retries: z.number().int().min(0).default(2),
+  /** 자체 리뷰 설정. */
+  review: reviewSchema.optional(),
+  /** 에이전트 백엔드 정의. */
+  backends: z.array(agentConfigSchema).min(1, 'At least one agent backend is required'),
 });
 
 export type ReviewConfig = z.infer<typeof reviewSchema>;
 
 // ---------------------------------------------------------------------------
-// Root config
+// 루트 설정
 // ---------------------------------------------------------------------------
 
-/** Raw YAML-parsed object before normalization. */
+/** 정규화 전 원시 YAML 파싱 객체. */
 const rawConfigSchema = z.object({
   workspace_backend: z.enum(['local', 'docker']).default('local'),
   trackers: z.array(trackerSchema).min(1, 'At least one tracker is required'),
-  /** One or more agent backends to run sequentially per issue. */
-  agents: z.array(agentConfigSchema).min(1, 'At least one agent is required'),
+  agents: agentsSchema,
   workspace: workspaceSchema,
   worker: workerSchema,
-  agent: agentSchema,
   docker: dockerSchema,
   observability: observabilitySchema,
   server: serverSchema,
   slack: slackSchema,
-  review: reviewSchema,
+  /**
+   * PR 코드 리뷰 피드백을 수신하는 출처.
+   * 'pr' (기본값): GitHub/Bitbucket의 PR 댓글만 사용.
+   * 'slack': Slack 스레드 답글만 사용 (이슈가 in_review 상태일 때).
+   * 'both': 두 출처를 동시에 사용.
+   */
+  pr_feedback_source: z.enum(['pr', 'slack', 'both']).default('pr'),
 });
 
-/** Fully-parsed, validated config with `trackers` and `agents` always populated. */
+/** `trackers`와 `agents`가 항상 채워진 완전히 파싱되고 검증된 설정. */
 export const configSchema = rawConfigSchema.transform((raw) => {
   const trackers = raw.trackers.map((t) => {
     const s = t.states;
     const derivedActive = [s.planning, s.in_progress];
     const derivedTerminal = [s.done, ...(s.canceled ? [s.canceled] : [])];
+
+    // 정규화: repository (단수) → repositories (배열)
+    const repositories: RepositoryConfig[] = t.repositories && t.repositories.length > 0
+      ? t.repositories
+      : t.repository ? [t.repository] : [];
+
     return {
       ...t,
       active_states: t.active_states.length > 0 ? t.active_states : derivedActive,
       terminal_states: t.terminal_states.length > 0 ? t.terminal_states : derivedTerminal,
+      repositories,
     };
   });
 
@@ -378,12 +413,11 @@ export const configSchema = rawConfigSchema.transform((raw) => {
     agents: raw.agents,
     workspace: raw.workspace,
     worker: raw.worker,
-    agent: raw.agent,
     docker: raw.docker,
     observability: raw.observability,
     server: raw.server,
     slack: raw.slack,
-    review: raw.review,
+    pr_feedback_source: raw.pr_feedback_source,
   };
 });
 

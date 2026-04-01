@@ -43,9 +43,6 @@ WORKDIR /workspace
 # -v ~/.claude:/home/worker/.claude:ro
 RUN mkdir -p /home/worker/.claude
 
-# Embed skills (built from host)
-COPY --chown=worker:worker .skills/ /home/worker/.skills/
-
 # Verify installations
 RUN node --version && npm --version && claude --version || true
 

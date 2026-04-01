@@ -1,12 +1,12 @@
 /**
- * Docker workspace backend — creates/reuses per-issue containers.
- * Mirrors elixir/lib/symphony_elixir/workspace_backend/docker.ex
+ * Docker 워크스페이스 백엔드 — 이슈별 컨테이너를 생성하거나 재사용합니다.
+ * elixir/lib/symphony_elixir/workspace_backend/docker.ex 를 미러링합니다.
  *
- * Lifecycle:
- *  - create: reuse existing container if present; otherwise start new one and
- *    run after_create hook inside the container.
- *  - cleanup: called only on terminal state — removes the container.
- *  - hooks (before_run/after_run): run inside the container via `docker exec`.
+ * 생명주기:
+ *  - create: 기존 컨테이너가 있으면 재사용하고, 없으면 새로 시작한 뒤
+ *    컨테이너 내부에서 after_create 훅을 실행합니다.
+ *  - cleanup: 종료 상태에서만 호출되며 컨테이너를 제거합니다.
+ *  - hooks (before_run/after_run): `docker exec`를 통해 컨테이너 내부에서 실행됩니다.
  */
 
 import os from 'node:os';
@@ -30,7 +30,6 @@ const ENV_PASS_THROUGH = [
   'LINEAR_API_KEY',
   'JIRA_API_TOKEN',
   'JIRA_EMAIL',
-  'JIRA_HOST',
   'BITBUCKET_API_TOKEN',
   'BITBUCKET_WORKSPACE',
   'SLACK_BOT_TOKEN',
@@ -53,7 +52,7 @@ export class DockerWorkspaceBackend implements WorkspaceBackend {
     const name = containerName(issue);
 
     if (await containerExists(name)) {
-      logger.info(`Reusing existing container for ${issueCtx(issue)}`, { container: name });
+      logger.debug(`Reusing existing container for ${issueCtx(issue)}`, { container: name });
       return { workspace: WORKSPACE_PATH, containerName: name };
     }
 
@@ -102,7 +101,7 @@ export class DockerWorkspaceBackend implements WorkspaceBackend {
   }
 
   // ---------------------------------------------------------------------------
-  // Container startup
+  // 컨테이너 시작
   // ---------------------------------------------------------------------------
 
   private async startContainer(name: string, issue: Issue): Promise<WorkspaceRef> {
@@ -116,11 +115,28 @@ export class DockerWorkspaceBackend implements WorkspaceBackend {
       '--workdir', WORKSPACE_PATH,
     ];
 
-    // Resource limits
+    // 리소스 제한
     if (cfg.memory) dockerArgs.push('--memory', cfg.memory);
     if (cfg.cpus) dockerArgs.push('--cpus', cfg.cpus);
 
-    // Environment variables
+    // .claude/skills 읽기 전용 마운트 (서브 에이전트 및 리뷰용 스킬)
+    const skillsDir = path.resolve('.claude/skills');
+    if (fs.existsSync(skillsDir)) {
+      dockerArgs.push('-v', `${skillsDir}:/home/worker/.claude/skills:ro`);
+    }
+
+    // .claude/agents 읽기 전용 마운트 (서브 에이전트 페르소나)
+    const agentsDir = path.resolve('.claude/agents');
+    if (fs.existsSync(agentsDir)) {
+      dockerArgs.push('-v', `${agentsDir}:/home/worker/.claude/agents:ro`);
+    }
+
+    // 호스트 로그 디렉토리 마운트 — 컨테이너 제거 후에도 유지됨
+    const logsDir = path.resolve('logs');
+    fs.mkdirSync(logsDir, { recursive: true });
+    dockerArgs.push('-v', `${logsDir}:/logs`);
+
+    // 환경 변수
     for (const envVar of ENV_PASS_THROUGH) {
       const value = process.env[envVar];
       if (value) dockerArgs.push('-e', `${envVar}=${value}`);
@@ -140,24 +156,27 @@ export class DockerWorkspaceBackend implements WorkspaceBackend {
 
     const ref: WorkspaceRef = { workspace: WORKSPACE_PATH, containerName: name };
 
-    // Inject Claude credentials directly into the container (no file written to host disk).
+    // Claude 자격증명을 컨테이너에 직접 주입 (호스트 디스크에는 파일을 기록하지 않음).
     await injectClaudeCredentials(name, cfg.auth_mount);
 
-    // Inject git credentials via credential.helper store (no token in git URLs).
+    // credential.helper store를 통해 git 자격증명 주입 (git URL에 토큰 포함하지 않음).
     await injectGitCredentials(name);
 
-    // after_create hook (runs after credentials, before clone — fatal on failure)
+    // after_create 훅 (자격증명 주입 후, 클론 전에 실행 — 실패 시 치명적 오류)
     const afterCreate = this.hooks?.after_create;
     if (afterCreate && afterCreate.trim() !== '') {
       logger.info(`Running after_create hook in container ${name} for ${issueCtx(issue)}`);
       await dockerExec(name, afterCreate, this.hookTimeoutMs);
     }
 
-    // Auto-clone
+    // 자동 클론
     if (this.repository) {
       const cloneUrl = buildCloneUrl(this.repository);
       logger.info(`Cloning ${cloneUrl} into container ${name}`);
       await dockerExec(name, `git clone --depth 1 ${cloneUrl} .`, this.hookTimeoutMs);
+
+      // .claude/skills를 워크스페이스에 심볼릭 링크 (마운트 경로: /home/worker/.claude/skills)
+      await dockerExec(name, `mkdir -p /workspace/.claude && test -d /home/worker/.claude/skills && ln -sf /home/worker/.claude/skills /workspace/.claude/skills || true`, 30_000);
 
       // after_clone hook
       if (this.hooks?.after_clone?.trim()) {
@@ -170,7 +189,7 @@ export class DockerWorkspaceBackend implements WorkspaceBackend {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// 헬퍼 함수
 // ---------------------------------------------------------------------------
 
 export async function dockerExec(
@@ -208,7 +227,7 @@ export function containerNameForIssue(issue: Issue): string {
   return CONTAINER_PREFIX + safe;
 }
 
-/** List all running symphony containers, returning their names. */
+/** 실행 중인 모든 symphony 컨테이너를 나열하고 이름을 반환합니다. */
 export async function listSymphonyContainers(): Promise<string[]> {
   const result = await spawnAsync(
     'docker',
@@ -219,7 +238,7 @@ export async function listSymphonyContainers(): Promise<string[]> {
   return result.stdout.split('\n').map((s) => s.trim()).filter((s) => s !== '');
 }
 
-/** Extract issue identifier from container name (reverse of containerNameForIssue). */
+/** 컨테이너 이름에서 이슈 식별자를 추출합니다 (containerNameForIssue의 역연산). */
 export function identifierFromContainerName(name: string): string | null {
   if (!name.startsWith(CONTAINER_PREFIX)) return null;
   return name.slice(CONTAINER_PREFIX.length);
@@ -246,14 +265,15 @@ export async function dockerExecWrite(containerName: string, filePath: string, c
 async function injectGitCredentials(container: string): Promise<void> {
   const lines: string[] = [];
 
-  // GitHub
+  // GitHub 자격증명
   const ghToken = process.env['GITHUB_TOKEN'];
   if (ghToken) {
     lines.push(`https://oauth2:${ghToken}@github.com`);
   }
 
-  // Bitbucket
+  // Bitbucket 자격증명
   const bbToken = process.env['BITBUCKET_API_TOKEN'];
+
   if (bbToken) {
     const bbUser = process.env['BITBUCKET_EMAIL'] || 'x-token-auth';
     lines.push(`https://${encodeURIComponent(bbUser)}:${encodeURIComponent(bbToken)}@bitbucket.org`);
@@ -293,7 +313,7 @@ async function injectClaudeCredentials(container: string, configuredAuthMount: s
     return;
   }
 
-  // Write directly into the container via docker exec — nothing touches the host disk.
+  // docker exec를 통해 컨테이너에 직접 기록 — 호스트 디스크에는 아무것도 기록하지 않음.
   const result = await spawnAsync(
     'docker',
     ['exec', '--user', 'worker', '-i', container, 'bash', '-c',
@@ -308,6 +328,44 @@ async function injectClaudeCredentials(container: string, configuredAuthMount: s
     });
   } else {
     logger.info('Injected Claude credentials into container', { container });
+  }
+}
+
+/**
+ * 특정 인증 디렉토리에서 Claude 자격증명을 주입합니다 (개발자별 오버라이드).
+ * macOS Keychain을 건너뛰고 지정된 디렉토리의 .credentials.json을 직접 읽습니다.
+ */
+export async function injectClaudeCredentialsFromDir(
+  container: string,
+  authDir: string,
+): Promise<void> {
+  const dir = authDir.startsWith('~')
+    ? path.join(os.homedir(), authDir.slice(1))
+    : authDir;
+  const credFile = path.join(dir, '.credentials.json');
+
+  let json: string;
+  try {
+    json = fs.readFileSync(credFile, 'utf8');
+  } catch {
+    logger.warn(`Claude credentials not found at ${credFile}`, { container });
+    return;
+  }
+
+  const result = await spawnAsync(
+    'docker',
+    ['exec', '--user', 'worker', '-i', container, 'bash', '-c',
+      'mkdir -p /home/worker/.claude && cat > /home/worker/.claude/.credentials.json && chmod 600 /home/worker/.claude/.credentials.json'],
+    { input: json, timeoutMs: 10_000 },
+  );
+
+  if (result.status !== 0) {
+    logger.warn('Failed to inject Claude credentials from auth dir', {
+      container, authDir,
+      stderr: result.stderr?.trim().slice(0, 200),
+    });
+  } else {
+    logger.info('Injected Claude credentials from auth dir', { container, authDir });
   }
 }
 

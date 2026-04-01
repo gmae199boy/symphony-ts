@@ -1,5 +1,5 @@
 /**
- * Core domain types shared across the entire system.
+ * 시스템 전체에서 공유되는 핵심 도메인 타입.
  */
 
 export interface Issue {
@@ -12,6 +12,7 @@ export interface Issue {
   branchName: string | null;
   url: string;
   assigneeId: string | null;
+  assigneeEmail: string | null;
   labels: string[];
   blockedBy: BlockerRef[];
   assignedToWorker: boolean;
@@ -26,7 +27,7 @@ export interface BlockerRef {
 }
 
 // ---------------------------------------------------------------------------
-// Agent messages
+// 에이전트 메시지
 // ---------------------------------------------------------------------------
 
 export type AgentEventKind =
@@ -42,8 +43,26 @@ export interface AgentMessage {
 export type AgentMessageHandler = (message: AgentMessage) => void;
 
 // ---------------------------------------------------------------------------
-// Tracker interface
+// 트래커 인터페이스
 // ---------------------------------------------------------------------------
+
+export interface TrackerComment {
+  id: string;
+  body: string;
+  authorId: string;
+  authorEmail?: string;
+  isBot: boolean;
+  createdAt: Date | null;
+}
+
+export interface FeedbackResponseEvent {
+  issueIdentifier: string;
+  issueId: string;
+  responseText: string;
+  workspaceName: string;
+  isApproval: boolean;
+  source: 'slack';
+}
 
 export interface TrackerClient {
   fetchCandidateIssues(): Promise<Issue[]>;
@@ -51,10 +70,12 @@ export interface TrackerClient {
   fetchIssueByIdentifier(identifier: string): Promise<Issue | null>;
   transitionIssue(id: string, toState: string): Promise<void>;
   createComment(id: string, body: string): Promise<void>;
+  fetchComments(issueId: string, since?: Date): Promise<TrackerComment[]>;
+  getBotIdentity(): Promise<string | null>;
 }
 
 // ---------------------------------------------------------------------------
-// Repository (GitHub / Bitbucket) types
+// 저장소 (GitHub / Bitbucket) 타입
 // ---------------------------------------------------------------------------
 
 export interface PullRequest {
@@ -64,18 +85,18 @@ export interface PullRequest {
   branchName: string;
   labels: string[];
   issueIdentifier: string | null;
-  state: string; // 'open' | 'closed' | 'merged'
+  state: string; // 'open' | 'closed' | 'merged' (열림 | 닫힘 | 병합됨)
 }
 
 export interface Review {
   id: number;
-  state: string; // 'APPROVED' | 'CHANGES_REQUESTED' | 'COMMENTED' | 'DISMISSED'
+  state: string; // 'APPROVED' | 'CHANGES_REQUESTED' | 'COMMENTED' | 'DISMISSED' (승인됨 | 변경 요청 | 코멘트 | 해제됨)
   authorLogin: string;
   submittedAt: Date | null;
 }
 
 export interface Comment {
-  /** Namespaced: "issue:{id}" or "review:{id}" to avoid cross-type ID collisions. */
+  /** 네임스페이스 적용: 타입 간 ID 충돌 방지를 위해 "issue:{id}" 또는 "review:{id}" 형식 사용. */
   id: string;
   body: string;
   authorLogin: string;
@@ -87,7 +108,17 @@ export interface Comment {
 
 export type RepoEventKind = 'new_comments' | 'pr_merged';
 
-export type DispatchReason = 'new_issue' | 'recovery' | 'pr_feedback' | 'slack_response' | 'retry';
+export type DispatchReason = 'new_issue' | 'recovery' | 'pr_feedback' | 'slack_response' | 'retry' | 'review_fix';
+
+export type IssuePhase =
+  | 'initial'
+  | 'plan_sent'
+  | 'pr_plan_sent'   // PR 피드백 계획 대기 (plan_sent와 달리 승인 시 pr_fixing으로 복귀)
+  | 'implementing'
+  | 'question_sent'
+  | 'review_sent'
+  | 'review_fixing'
+  | 'pr_fixing';
 
 export interface RepoEvent {
   kind: RepoEventKind;
@@ -99,13 +130,13 @@ export interface RepoEvent {
 export type RepoEventHandler = (event: RepoEvent) => void;
 
 // ---------------------------------------------------------------------------
-// Workspace
+// 워크스페이스
 // ---------------------------------------------------------------------------
 
 export interface WorkspaceRef {
-  workspace: string; // absolute path
-  containerName?: string; // Docker only
-  workerHost?: string; // SSH worker only
+  workspace: string; // 절대 경로
+  containerName?: string; // Docker 전용
+  workerHost?: string; // SSH 워커 전용
 }
 
 export interface WorkspaceBackend {
@@ -116,32 +147,32 @@ export interface WorkspaceBackend {
 }
 
 /**
- * Runtime file I/O and workspace queries — abstracts Docker exec, local fs,
- * and (future) SSH exec behind a single interface.
+ * 런타임 파일 I/O 및 워크스페이스 조회 — Docker exec, 로컬 fs,
+ * (미래의) SSH exec를 단일 인터페이스로 추상화.
  */
 export interface WorkspaceIO {
-  /** Read a file relative to the workspace root. Returns null if not found. */
+  /** 워크스페이스 루트 기준 상대 경로로 파일 읽기. 없으면 null 반환. */
   readFile(ref: WorkspaceRef, relativePath: string): Promise<string | null>;
-  /** Write a file relative to the workspace root. Creates parent dirs. */
+  /** 워크스페이스 루트 기준 상대 경로로 파일 쓰기. 상위 디렉토리 자동 생성. */
   writeFile(ref: WorkspaceRef, relativePath: string, content: string): Promise<void>;
-  /** Get git diff of uncommitted or last commit changes. */
-  getDiff(ref: WorkspaceRef): Promise<string | null>;
-  /** Check if the workspace exists (container running / directory exists). */
+  /** git diff 조회. base가 제공되면 해당 커밋에서 HEAD까지의 diff 반환; 없으면 전체 PR diff (origin/main...HEAD) 반환. */
+  getDiff(ref: WorkspaceRef, base?: string): Promise<string | null>;
+  /** 워크스페이스 존재 여부 확인 (컨테이너 실행 중 / 디렉토리 존재). */
   exists(ref: WorkspaceRef): Promise<boolean>;
-  /** List all managed workspaces. Returns name + issue identifier. */
+  /** 관리 중인 모든 워크스페이스 목록 반환. 이름 + 이슈 식별자 포함. */
   list(): Promise<{ name: string; identifier: string }[]>;
-  /** Extract issue identifier from a workspace name. */
+  /** 워크스페이스 이름에서 이슈 식별자 추출. */
   identifierFromName(name: string): string | null;
-  /** Derive the workspace name for a given issue. */
+  /** 주어진 이슈의 워크스페이스 이름 도출. */
   nameForIssue(issue: Issue): string;
-  /** Build a WorkspaceRef for an issue (without creating the workspace). */
+  /** 이슈에 대한 WorkspaceRef 생성 (워크스페이스를 실제로 만들지는 않음). */
   refForIssue(issue: Issue): WorkspaceRef;
-  /** Reconstruct a WorkspaceRef from a workspace name (reverse of nameForIssue). */
+  /** 워크스페이스 이름으로 WorkspaceRef 재구성 (nameForIssue의 역방향). */
   refFromName(name: string): WorkspaceRef;
 }
 
 // ---------------------------------------------------------------------------
-// Agent backend
+// 에이전트 백엔드
 // ---------------------------------------------------------------------------
 
 export interface AgentRunResult {
@@ -152,7 +183,6 @@ export interface AgentRunResult {
 export interface AgentBackend {
   run(
     workspace: string,
-    prompt: string,
     issue: Issue,
     opts: AgentRunOpts,
   ): Promise<AgentRunResult>;
@@ -160,7 +190,7 @@ export interface AgentBackend {
 }
 
 // ---------------------------------------------------------------------------
-// Messenger
+// 메신저
 // ---------------------------------------------------------------------------
 
 export interface MessengerClient {
@@ -169,7 +199,7 @@ export interface MessengerClient {
 }
 
 // ---------------------------------------------------------------------------
-// Agent run options
+// 에이전트 실행 옵션
 // ---------------------------------------------------------------------------
 
 export interface AgentRunOpts {
@@ -179,6 +209,10 @@ export interface AgentRunOpts {
   onMessage?: AgentMessageHandler;
   timeoutMs?: number;
   signal?: AbortSignal;
-  /** Model override (e.g. 'opus', 'sonnet') — passed as --model flag to Claude CLI. */
+  /** 모델 오버라이드 (예: 'opus', 'sonnet') — Claude CLI의 --model 플래그로 전달. */
   model?: string;
+  /** 렌더링된 WORKFLOW 프롬프트. 백엔드가 주입 방식을 결정. */
+  workflow: string;
+  /** dispatch 시 에이전트에게 전달할 메시지. */
+  resumeMessage?: string;
 }

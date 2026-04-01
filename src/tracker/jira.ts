@@ -9,7 +9,7 @@ import { z } from 'zod';
 import { logger } from '../logger.js';
 import { fetchWithRetry } from '../fetch-retry.js';
 import { parseDate } from '../utils.js';
-import type { Issue, TrackerClient } from '../types.js';
+import type { BlockerRef, Issue, TrackerClient, TrackerComment } from '../types.js';
 import type { JiraTrackerConfig } from '../config/schema.js';
 
 const MAX_RESULTS = 50;
@@ -23,13 +23,35 @@ const JiraStatusSchema = z.object({
   name: z.string(),
 });
 
+const JiraIssueLinkTypeSchema = z.object({
+  name: z.string(),
+  inward: z.string(),
+  outward: z.string(),
+});
+
+const JiraLinkedIssueSchema = z.object({
+  id: z.string(),
+  key: z.string(),
+  fields: z.object({ status: JiraStatusSchema }),
+});
+
+const JiraIssueLinkSchema = z.object({
+  type: JiraIssueLinkTypeSchema,
+  inwardIssue: JiraLinkedIssueSchema.optional(),
+  outwardIssue: JiraLinkedIssueSchema.optional(),
+});
+
 const JiraIssueFieldsSchema = z.object({
   summary: z.string(),
   description: z.unknown().nullable().optional(), // ADF format, not used directly
   priority: z.object({ id: z.string().optional(), name: z.string().optional() }).nullable().optional(),
   status: JiraStatusSchema,
-  assignee: z.object({ accountId: z.string() }).nullable().optional(),
+  assignee: z.object({
+    accountId: z.string(),
+    emailAddress: z.string().optional(),
+  }).nullable().optional(),
   labels: z.array(z.string()).optional(),
+  issuelinks: z.array(JiraIssueLinkSchema).optional(),
   created: z.string().nullable().optional(),
   updated: z.string().nullable().optional(),
 });
@@ -50,6 +72,24 @@ const JiraSearchResponseSchema = z.object({
 
 const JiraMyselfSchema = z.object({
   accountId: z.string(),
+});
+
+const JiraCommentBodySchema = z.unknown();
+
+const JiraCommentAuthorSchema = z.object({
+  accountId: z.string(),
+  emailAddress: z.string().optional(),
+});
+
+const JiraCommentSchema = z.object({
+  id: z.string(),
+  body: JiraCommentBodySchema,
+  author: JiraCommentAuthorSchema,
+  created: z.string(),
+});
+
+const JiraCommentsResponseSchema = z.object({
+  comments: z.array(JiraCommentSchema),
 });
 
 const JiraTransitionSchema = z.object({
@@ -180,6 +220,31 @@ export class JiraClient implements TrackerClient {
     logger.info(`Jira: transitioned issue ${id} to "${toState}"`);
   }
 
+  async fetchComments(issueId: string, since?: Date): Promise<TrackerComment[]> {
+    const rawText = await this.request('GET', `/rest/api/3/issue/${issueId}/comment?expand=renderedBody&maxResults=100`);
+    const data = JiraCommentsResponseSchema.parse(JSON.parse(rawText));
+    const myAccountId = await this.resolveMyAccountId();
+
+    return data.comments
+      .filter((c) => {
+        if (!since) return true;
+        const createdAt = parseDate(c.created);
+        return createdAt !== null && createdAt > since;
+      })
+      .map((c) => ({
+        id: c.id,
+        body: adfToText(c.body).trim(),
+        authorId: c.author.accountId,
+        authorEmail: c.author.emailAddress,
+        isBot: myAccountId !== null && c.author.accountId === myAccountId,
+        createdAt: parseDate(c.created),
+      }));
+  }
+
+  async getBotIdentity(): Promise<string | null> {
+    return this.resolveMyAccountId();
+  }
+
   async createComment(id: string, body: string): Promise<void> {
     // Jira v3 requires Atlassian Document Format (ADF)
     const adfBody = {
@@ -252,7 +317,7 @@ export class JiraClient implements TrackerClient {
       const params = new URLSearchParams({
         jql,
         maxResults: String(MAX_RESULTS),
-        fields: 'summary,description,priority,status,assignee,labels,created,updated',
+        fields: 'summary,description,priority,status,assignee,labels,issuelinks,created,updated',
       });
       if (nextPageToken) params.set('nextPageToken', nextPageToken);
 
@@ -291,6 +356,50 @@ export class JiraClient implements TrackerClient {
 }
 
 // ---------------------------------------------------------------------------
+// ADF → plain text
+// ---------------------------------------------------------------------------
+
+function adfToText(node: unknown): string {
+  if (!node || typeof node !== 'object') return '';
+  const n = node as Record<string, unknown>;
+
+  if (n['type'] === 'text') return typeof n['text'] === 'string' ? n['text'] : '';
+
+  const children = Array.isArray(n['content']) ? (n['content'] as unknown[]) : [];
+  const childText = children.map(adfToText).join('');
+
+  switch (n['type']) {
+    case 'paragraph': return childText + '\n';
+    case 'heading': return childText + '\n';
+    case 'bulletList':
+    case 'orderedList': return childText;
+    case 'listItem': return '- ' + childText.trimEnd() + '\n';
+    case 'blockquote': return '> ' + childText.trimEnd() + '\n';
+    case 'codeBlock': return '```\n' + childText + '```\n';
+    case 'rule': return '---\n';
+    case 'hardBreak': return '\n';
+    default: return childText;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Blocking
+// ---------------------------------------------------------------------------
+
+function extractBlockers(issuelinks: z.infer<typeof JiraIssueLinkSchema>[]): BlockerRef[] {
+  return issuelinks.flatMap((link) => {
+    // "is blocked by" inwardIssue → inwardIssue is our blocker
+    if (!link.inwardIssue) return [];
+    if (!link.type.inward.toLowerCase().includes('blocked by')) return [];
+    return [{
+      id: link.inwardIssue.id,
+      identifier: link.inwardIssue.key,
+      state: link.inwardIssue.fields.status.name,
+    }];
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Normalization
 // ---------------------------------------------------------------------------
 
@@ -299,18 +408,22 @@ function normalizeJiraIssue(data: JiraIssue, baseUrl: string): Issue {
     ? parseInt(data.fields.priority.id, 10)
     : null;
 
+  const rawDesc = data.fields.description;
+  const description = rawDesc ? adfToText(rawDesc).trim() || null : null;
+
   return {
     id: data.id,
     identifier: data.key,
     title: data.fields.summary,
-    description: null, // ADF is complex; agents use Jira MCP for full descriptions
+    description,
     priority: isNaN(priorityNum ?? NaN) ? null : priorityNum,
     state: data.fields.status.name,
-    branchName: null, // Jira doesn't have built-in branch tracking
+    branchName: null,
     url: `${baseUrl}/browse/${data.key}`,
     assigneeId: data.fields.assignee?.accountId ?? null,
+    assigneeEmail: data.fields.assignee?.emailAddress ?? null,
     labels: data.fields.labels ?? [],
-    blockedBy: [], // Would require separate link query; not critical for MVP
+    blockedBy: extractBlockers(data.fields.issuelinks ?? []),
     assignedToWorker: true,
     createdAt: parseDate(data.fields.created ?? null),
     updatedAt: parseDate(data.fields.updated ?? null),

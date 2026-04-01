@@ -7,7 +7,9 @@
   "bin": {
     "symphony": "dist/index.js"
   },
+  "packageManager": "pnpm@10.28.0",
   "scripts": {
+    "preinstall": "npx only-allow pnpm",
     "build": "tsc",
     "docker:build": "docker build -t symphony-worker:latest -f docker/Dockerfile .",
     "dev": "node --env-file=.env --import tsx/esm src/index.ts",

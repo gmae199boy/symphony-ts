@@ -48,7 +48,12 @@ export async function fetchWithRetry(
     if (attempt >= maxRetries) break;
 
     const delayMs = delayFn(response, attempt);
-    logger.warn(`HTTP ${response.status} from ${urlLabel(input)}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${maxRetries})`);
+    const retryAfter = response.headers.get('Retry-After');
+    logger.warn(`HTTP ${response.status} from ${urlLabel(input)}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${maxRetries})`, {
+      status: response.status,
+      retryAfterHeader: retryAfter,
+      computedDelayMs: delayMs,
+    });
     await sleep(delayMs);
   }
 

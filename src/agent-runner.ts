@@ -12,9 +12,10 @@
 
 import { logger } from './logger.js';
 import { issueCtx } from './utils.js';
-import { buildPrompt, buildResumePrompt, type PromptExtras } from './prompt-builder.js';
+import { buildPrompt, type PromptExtras } from './prompt-builder.js';
 import { createAgentBackend } from './agent/factory.js';
 import { createWorkspaceBackend } from './workspace/io.js';
+import { injectClaudeCredentialsFromDir } from './workspace/docker.js';
 import type { Issue, AgentBackend, WorkspaceBackend, WorkspaceRef, WorkspaceIO, AgentMessageHandler, TrackerClient, DispatchReason } from './types.js';
 import type { Config, AgentConfig, RepositoryConfig, StatesConfig } from './config/schema.js';
 
@@ -37,14 +38,20 @@ export interface RunOptions {
   activeStates?: string[];
   /** Why this run was dispatched */
   reason?: DispatchReason;
+  /** 재실행 시 에이전트에게 전달할 메시지 (--continue -p 로 전달됨) */
+  resumeMessage?: string;
   /** WorkspaceIO for file access (pending_plan/question detection) */
   io?: WorkspaceIO;
   /** Repository config for auto-clone */
   repository?: RepositoryConfig;
   /** Semantic state mapping for prompt template */
   states?: StatesConfig;
+  /** PR feedback source for WORKFLOW template variable */
+  prFeedbackSource?: string;
   /** Model override for this run (e.g. 'opus', 'sonnet') */
   model?: string;
+  /** Host directory containing Claude Code auth/session files for per-developer credential injection. */
+  claudeAuthDir?: string;
 }
 
 export interface RuntimeInfo {
@@ -66,7 +73,7 @@ export async function runIssue(
     config.worker.ssh_hosts,
   );
 
-  logger.info(
+  logger.debug(
     `Starting agent run for ${issueCtx(issue)} worker_hosts=${JSON.stringify(workerHostsForLog(workerHosts))}`,
   );
 
@@ -109,12 +116,17 @@ async function runOnWorkerHost(
   workerHost: string | null,
   opts: RunOptions & { promptExtras?: PromptExtras },
 ): Promise<void> {
-  logger.info(
+  logger.debug(
     `Starting worker attempt for ${issueCtx(issue)} worker_host=${workerHost ?? 'local'}`,
   );
 
   const workspaceBackend = createWorkspaceBackend(config, opts.repository);
   const ref = await workspaceBackend.create(issue, workerHost ?? undefined);
+
+  // Per-developer Claude auth override: re-inject credentials from the specified directory.
+  if (opts.claudeAuthDir && ref.containerName) {
+    await injectClaudeCredentialsFromDir(ref.containerName, opts.claudeAuthDir);
+  }
 
   opts.onRuntimeInfo?.({
     workerHost,
@@ -175,37 +187,85 @@ async function runAgentTurns(
   opts: RunOptions,
   issueStateFetcher: (ids: string[]) => Promise<Issue[]>,
 ): Promise<void> {
-  const maxTurns = agentConfig.max_turns;
-  const reason = opts.reason;
+  const workflow = await buildPrompt(promptTemplate, issue, 1, {
+    trackerKind: opts.trackerKind,
+    repositoryKind: opts.repositoryKind,
+    states: opts.states,
+    prFeedbackSource: opts.prFeedbackSource,
+  });
+
+  if (agentConfig.kind === 'claude') {
+    // Claude: 1회 실행 — CLI 내부에서 멀티턴 처리
+    await runSingleExecution(agentBackend, agentConfig, workflow, ref, opts, issue);
+  } else {
+    // Codex: 오케스트레이터 멀티턴 루프
+    await runMultiTurnLoop(agentBackend, agentConfig, config, workflow, ref, opts, issue, issueStateFetcher);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Claude: single execution (no orchestrator turn loop)
+// ---------------------------------------------------------------------------
+
+async function runSingleExecution(
+  agentBackend: AgentBackend,
+  agentConfig: AgentConfig,
+  workflow: string,
+  ref: WorkspaceRef,
+  opts: RunOptions,
+  issue: Issue,
+): Promise<void> {
+  if (opts.signal?.aborted) throw new Error('Agent run aborted');
+
+  const turnTimeoutMs = 'turn_timeout_ms' in agentConfig ? agentConfig.turn_timeout_ms : undefined;
+
+  const result = await agentBackend.run(ref.workspace, issue, {
+    containerName: ref.containerName,
+    workerHost: ref.workerHost,
+    onMessage: opts.onMessage,
+    timeoutMs: turnTimeoutMs,
+    signal: opts.signal,
+    model: opts.model,
+    workflow,
+    resumeMessage: opts.resumeMessage,
+  });
+
+  logger.info(`Completed ${agentConfig.kind} run for ${issueCtx(issue)} workspace=${ref.workspace}`);
+  opts.onTurnComplete?.({ cost: result.cost, tokensTotal: result.tokensTotal });
+}
+
+// ---------------------------------------------------------------------------
+// Codex: multi-turn loop (orchestrator-driven)
+// ---------------------------------------------------------------------------
+
+async function runMultiTurnLoop(
+  agentBackend: AgentBackend,
+  agentConfig: AgentConfig,
+  config: Config,
+  workflow: string,
+  ref: WorkspaceRef,
+  opts: RunOptions,
+  issue: Issue,
+  issueStateFetcher: (ids: string[]) => Promise<Issue[]>,
+): Promise<void> {
+  const maxTurns = agentConfig.max_turns ?? 20;
   let currentIssue = issue;
 
   for (let turnNumber = 1; turnNumber <= maxTurns; turnNumber++) {
-    // Build prompt — two branches:
-    //   1. New issue on turn 1 → full prompt
-    //   2. Everything else (re-dispatch or continuation) → resume prompt
-    let prompt: string;
-
-    if (turnNumber === 1 && (reason === 'new_issue' || reason == null)) {
-      prompt = await buildPrompt(promptTemplate, currentIssue, turnNumber, {
-        trackerKind: opts.trackerKind,
-        repositoryKind: opts.repositoryKind,
-        states: opts.states,
-      });
-    } else {
-      prompt = buildResumePrompt(reason, turnNumber, maxTurns, opts.trackerKind);
-    }
+    const resumeMessage = turnNumber === 1
+      ? opts.resumeMessage
+      : `Continuation guidance:\n- The previous agent turn completed normally, but the issue is still in an active state.\n- This is continuation turn #${turnNumber} of ${maxTurns}.\n- Resume from current workspace state instead of restarting.\n- Focus on remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.`;
 
     if (opts.signal?.aborted) throw new Error('Agent run aborted');
 
-    const turnTimeoutMs = 'turn_timeout_ms' in agentConfig ? agentConfig.turn_timeout_ms : undefined;
-
-    const result = await agentBackend.run(ref.workspace, prompt, currentIssue, {
+    const result = await agentBackend.run(ref.workspace, currentIssue, {
       containerName: ref.containerName,
       workerHost: ref.workerHost,
       onMessage: opts.onMessage,
-      timeoutMs: turnTimeoutMs,
       signal: opts.signal,
       model: opts.model,
+      workflow,
+      resumeMessage,
     });
 
     logger.info(

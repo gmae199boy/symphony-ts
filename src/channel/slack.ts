@@ -1,0 +1,192 @@
+/**
+ * SlackChannel — HumanChannel implementation using Slack.
+ *
+ * Receives events via Socket Mode (WebSocket).
+ * Thread state is managed by SlackThreadManager.
+ */
+
+import { logger } from '../logger.js';
+import { SlackSocketReceiver, type SlackResponseEvent } from '../slack/socket.js';
+import { SlackThreadManager } from '../slack/thread-store.js';
+import { sendSlackMessage, sendSlackMessageChunked } from '../slack/notifier.js';
+import type { Issue } from '../types.js';
+import type { SlackConfig } from '../config/schema.js';
+import type { HumanChannel, ApprovalType, HumanResponseHandler } from './types.js';
+
+
+export class SlackChannel implements HumanChannel {
+  private readonly receiver: SlackSocketReceiver;
+  private readonly threadManager: SlackThreadManager;
+  private readonly config: NonNullable<SlackConfig>;
+  private readonly onResponse: HumanResponseHandler;
+
+  constructor(
+    config: NonNullable<SlackConfig>,
+    workspaceRoot: string,
+    onResponse: HumanResponseHandler,
+  ) {
+    this.config = config;
+    this.onResponse = onResponse;
+    this.threadManager = new SlackThreadManager(workspaceRoot);
+
+    const handleEvent = (event: SlackResponseEvent) => this.handleSlackEvent(event);
+
+    this.receiver = new SlackSocketReceiver(
+      { appToken: config.app_token, botToken: config.bot_token },
+      this.threadManager,
+      handleEvent,
+    );
+  }
+
+  async start(): Promise<void> {
+    this.threadManager.restore();
+    await this.receiver.start();
+  }
+
+  stop(): void {
+    this.receiver.stop();
+  }
+
+  async sendForApproval(
+    issue: Issue,
+    content: string,
+    type: ApprovalType,
+    workspaceName: string,
+  ): Promise<boolean> {
+    const existingThread = this.threadManager.getThread(issue.identifier);
+    let threadRegistered = !!existingThread;
+
+    let text: string;
+    let result: { ts: string; channel: string } | null;
+
+    if (type === 'review') {
+      let threadForReview = existingThread;
+      if (!threadForReview) {
+        const header = await sendSlackMessage(
+          this.config.bot_token,
+          this.config.channel,
+          `🔍 *[${issue.identifier}]* 셀프리뷰 결과`,
+        );
+        if (!header) return false;
+        this.threadManager.watch(issue.identifier, issue.id, workspaceName, {
+          channel: header.channel,
+          thread_ts: header.ts,
+          message_ts: header.ts,
+        });
+        threadRegistered = true;
+        threadForReview = this.threadManager.getThread(issue.identifier);
+      }
+      result = await sendSlackMessageChunked(
+        this.config.bot_token,
+        threadForReview?.threadInfo.channel ?? this.config.channel,
+        content,
+        threadForReview?.threadInfo.thread_ts,
+        (ts) => this.threadManager.updateLastReadTs(issue.identifier, ts),
+      );
+    } else if (type === 'plan') {
+      const planNumber = this.incrementPlanNumber(issue.identifier);
+      const planCount = (content.match(/^#{1,3}\s+Plan\s+\d+/gim) ?? []).length;
+      const footer = planCount > 1
+        ? `\n\n번호로 계획 선택 (예: "1" 또는 "plan 2"), ✅ 리액션 = Plan 1 선택, 피드백: 자유롭게 작성`
+        : `\n\n✅ 리액션 = 승인, 피드백: 자유롭게 작성`;
+      text = `📋 *[${issue.identifier}] 계획 #${planNumber}*\n\n${content}${footer}`;
+      result = await sendSlackMessageChunked(
+        this.config.bot_token,
+        existingThread?.threadInfo.channel ?? this.config.channel,
+        text,
+        existingThread?.threadInfo.thread_ts,
+        (ts) => this.threadManager.updateLastReadTs(issue.identifier, ts),
+      );
+    } else {
+      // question
+      text = `❓ *[${issue.identifier}]* 질문\n\n${content}`;
+      result = await sendSlackMessageChunked(
+        this.config.bot_token,
+        existingThread?.threadInfo.channel ?? this.config.channel,
+        text,
+        existingThread?.threadInfo.thread_ts,
+        (ts) => this.threadManager.updateLastReadTs(issue.identifier, ts),
+      );
+    }
+
+    if (!result) return false;
+
+    if (!threadRegistered) {
+      this.threadManager.watch(issue.identifier, issue.id, workspaceName, {
+        channel: result.channel,
+        thread_ts: result.ts,
+        message_ts: result.ts,
+      });
+    } else {
+      this.threadManager.updateLastReadTs(issue.identifier, result.ts);
+    }
+
+    if (type === 'plan' || type === 'review') {
+      this.threadManager.setApprovalMessageTs(issue.identifier, result.ts);
+    }
+
+    return true;
+  }
+
+  async sendNotification(issue: Issue, message: string, workspaceName?: string): Promise<void> {
+    const thread = this.threadManager.getThread(issue.identifier);
+    const result = await sendSlackMessage(
+      this.config.bot_token,
+      thread?.threadInfo.channel ?? this.config.channel,
+      message,
+      thread?.threadInfo.thread_ts,
+    );
+    if (result) {
+      if (!thread && workspaceName) {
+        this.threadManager.watch(issue.identifier, issue.id, workspaceName, {
+          channel: result.channel,
+          thread_ts: result.ts,
+          message_ts: result.ts,
+        });
+      } else {
+        this.threadManager.updateLastReadTs(issue.identifier, result.ts);
+      }
+    }
+  }
+
+  isWatching(issueIdentifier: string): boolean {
+    return this.threadManager.isWatching(issueIdentifier);
+  }
+
+  unwatch(issueIdentifier: string): void {
+    this.threadManager.unwatch(issueIdentifier);
+  }
+
+  getAllWatchedIdentifiers(): string[] {
+    return this.threadManager.getAllIdentifiers();
+  }
+
+  getThreadInfo(issueIdentifier: string): { channel: string; thread_ts: string } | undefined {
+    const thread = this.threadManager.getThread(issueIdentifier);
+    if (!thread) return undefined;
+    return { channel: thread.threadInfo.channel, thread_ts: thread.threadInfo.thread_ts };
+  }
+
+  getPlanNumber(issueIdentifier: string): number {
+    return this.threadManager.getThread(issueIdentifier)?.planNumber ?? 0;
+  }
+
+  incrementPlanNumber(issueIdentifier: string): number {
+    return this.threadManager.incrementPlanNumber(issueIdentifier);
+  }
+
+  forgetThread(issueIdentifier: string): void {
+    this.threadManager.forgetThread(issueIdentifier);
+  }
+
+  private handleSlackEvent(event: SlackResponseEvent): void {
+    this.onResponse({
+      issueIdentifier: event.issueIdentifier,
+      issueId: event.issueId,
+      responseText: event.responseText,
+      workspaceName: event.workspaceName,
+      isApproval: event.isApproval,
+      source: 'slack',
+    });
+  }
+}

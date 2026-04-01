@@ -8,7 +8,17 @@
       "WebFetch(domain:linear.app)",
       "WebFetch(domain:docs.slack.dev)",
       "Bash(git commit:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(gh api:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(wc:*)",
+      "Bash(git -C /Users/myunghun/Github/ai-runner diff HEAD WORKFLOW.md)",
+      "Bash(git -C /Users/myunghun/Github/ai-runner show HEAD:WORKFLOW.md)",
+      "WebFetch(domain:support.claude.com)",
+      "WebFetch(domain:blog.laozhang.ai)",
+      "Bash(npm install:*)",
+      "Bash(chmod:*)"
     ]
   }
 }
