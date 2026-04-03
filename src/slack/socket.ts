@@ -92,6 +92,7 @@ export class SlackSocketReceiver {
   private botUserId: string | null = null;
   private stopped = false;
   private backoffMs = BACKOFF_INITIAL_MS;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   // event_id dedup: envelope_id → received timestamp
   private readonly seenEnvelopeIds = new Map<string, number>();
@@ -116,6 +117,10 @@ export class SlackSocketReceiver {
 
   stop(): void {
     this.stopped = true;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -163,8 +168,12 @@ export class SlackSocketReceiver {
 
   private scheduleReconnect(): void {
     if (this.stopped) return;
+    if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
     logger.info(`Slack socket: reconnecting in ${this.backoffMs}ms`);
-    setTimeout(() => { void this.connect(); }, this.backoffMs);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.connect();
+    }, this.backoffMs);
     this.backoffMs = Math.min(this.backoffMs * 2, BACKOFF_MAX_MS);
   }
 

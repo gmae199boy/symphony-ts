@@ -87,7 +87,7 @@ export class SlackChannel implements HumanChannel {
       const planNumber = this.incrementPlanNumber(issue.identifier);
       const planCount = (content.match(/^#{1,3}\s+Plan\s+\d+/gim) ?? []).length;
       const footer = planCount > 1
-        ? `\n\n번호로 계획 선택 (예: "1" 또는 "plan 2"), ✅ 리액션 = Plan 1 선택, 피드백: 자유롭게 작성`
+        ? `\n\n번호로 계획 선택 (예: "1" 또는 "plan 2"), 피드백: 자유롭게 작성`
         : `\n\n✅ 리액션 = 승인, 피드백: 자유롭게 작성`;
       text = `📋 *[${issue.identifier}] 계획 #${planNumber}*\n\n${content}${footer}`;
       result = await sendSlackMessageChunked(

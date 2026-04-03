@@ -21,6 +21,11 @@ done < .sync.env
 : "${SYNC_HOST:?SYNC_HOST가 .sync.env에 설정되지 않았습니다}"
 : "${SYNC_REMOTE_PATH:?SYNC_REMOTE_PATH가 .sync.env에 설정되지 않았습니다}"
 
+# ~는 file read 시 확장되지 않으므로 직접 처리
+if [[ "${SYNC_KEY:-}" == "~"* ]]; then
+  SYNC_KEY="${HOME}${SYNC_KEY:1}"
+fi
+
 # ---------------------------------------------------------------------------
 # SSH 인증 방식 결정
 #
@@ -37,16 +42,18 @@ _has_ssh_config() {
   [[ -f ~/.ssh/config ]] && grep -qE "^[[:space:]]*Host[[:space:]]+${_HOST_ONLY}([[:space:]]|$)" ~/.ssh/config
 }
 
+_SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3"
+
 if _has_ssh_config && [[ -n "${SYNC_KEY:-}" ]]; then
   echo "==> '${_HOST_ONLY}'에 대한 SSH config 항목이 있습니다 — ~/.ssh/config 사용 (SYNC_KEY 무시)"
-  SSH="ssh -o StrictHostKeyChecking=no"
-  RSYNC_SSH="ssh -o StrictHostKeyChecking=no"
+  SSH="ssh ${_SSH_OPTS}"
+  RSYNC_SSH="ssh ${_SSH_OPTS}"
 elif [[ -n "${SYNC_KEY:-}" ]]; then
-  SSH="ssh -i ${SYNC_KEY} -o StrictHostKeyChecking=no"
-  RSYNC_SSH="ssh -i ${SYNC_KEY} -o StrictHostKeyChecking=no"
+  SSH="ssh -i ${SYNC_KEY} ${_SSH_OPTS}"
+  RSYNC_SSH="ssh -i ${SYNC_KEY} ${_SSH_OPTS}"
 elif _has_ssh_config; then
-  SSH="ssh -o StrictHostKeyChecking=no"
-  RSYNC_SSH="ssh -o StrictHostKeyChecking=no"
+  SSH="ssh ${_SSH_OPTS}"
+  RSYNC_SSH="ssh ${_SSH_OPTS}"
 else
   echo "오류: SSH 인증 방식을 찾을 수 없습니다."
   echo "  방법 1: .sync.env에 SYNC_KEY 설정 (예: SYNC_KEY=~/.ssh/my-key.pem)"
@@ -58,12 +65,9 @@ fi
 # rsync 설치 여부 확인 (로컬 및 원격)
 # ---------------------------------------------------------------------------
 
-# SYNC_REMOTE_PATH의 ~를 원격 홈 디렉토리로 해석.
-# bash가 .sync.env를 파싱할 때 ~를 로컬 기준으로 확장하므로 ~/foo가
-# /Users/myunghun/foo가 되어 Linux 원격 서버에서 잘못된 경로가 됨. 여기서 재해석.
-if [[ "${SYNC_REMOTE_PATH}" == "~"* ]]; then
-  REMOTE_HOME=$(${SSH} "${SYNC_HOST}" 'echo $HOME')
-  SYNC_REMOTE_PATH="${REMOTE_HOME}${SYNC_REMOTE_PATH:1}"
+# SYNC_KEY의 ~는 file read 시 확장되지 않으므로 직접 처리
+if [[ "${SYNC_KEY:-}" == "~"* ]]; then
+  SYNC_KEY="${HOME}${SYNC_KEY:1}"
 fi
 
 ensure_brew_local() {
@@ -236,7 +240,7 @@ case "$COMMAND" in
 
   startup)
     echo "==> 원격 서버에 pm2 startup 훅 등록 중..."
-    ${SSH} "${SYNC_HOST}" "cd ${SYNC_REMOTE_PATH} && sudo make startup"
+    ${SSH} "${SYNC_HOST}" "cd ${SYNC_REMOTE_PATH} && make startup"
     ;;
 
   start)
@@ -264,8 +268,13 @@ case "$COMMAND" in
     ${SSH} "${SYNC_HOST}" "cd ${SYNC_REMOTE_PATH} && make status"
     ;;
 
+  clean)
+    echo "==> 원격 서버 초기화 중..."
+    ${SSH} "${SYNC_HOST}" "bash -lc 'cd ${SYNC_REMOTE_PATH} && make clean'"
+    ;;
+
   *)
-    echo "사용법: $0 {upload|init|startup|start|stop|logs|reload|status}"
+    echo "사용법: $0 {upload|init|startup|start|stop|logs|reload|status|clean}"
     exit 1
     ;;
 esac

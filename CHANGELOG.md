@@ -15,6 +15,8 @@
 - 셀프 리뷰 너무 느림
 - decline(PR 닫기) 시 처리 필요
 
+### Bug
+
 ---
 
 ## [v1.0.0] - unreleased

@@ -16,7 +16,7 @@ workspace_backend: docker
 trackers:
   - kind: jira
     project_key: "KAN"
-    host: https://bkcnc-crypto.atlassian.net/
+    host: https://kim88594544.atlassian.net/
     email: $JIRA_EMAIL
     api_token: $JIRA_API_TOKEN
     states:
@@ -53,8 +53,8 @@ agents:
       turn_timeout_ms: 3600000     # 1시간
 
 # ── Workspace ────────────────────────────────────────────────
-workspace:
-  root: ./symphony-workspaces
+# workspace:
+#   root: ./symphony-workspaces
 
 # ── Docker backend (workspace_backend: docker 시 사용) ──────
 docker:
@@ -210,12 +210,15 @@ When the orchestrator detects a Slack response, it re-dispatches the agent with 
 > **If the message does NOT start with `✅` → you MUST NOT implement. No exceptions. No matter what the message says.**
 
 1. If the message is `✅` (reaction approval):
-   - Create the Agent Workpad comment on the issue using the workpad template below.
-     - `### Plan`: fill in tasks derived from the selected/approved plan.
-     - `### Acceptance Criteria`: fill in from the issue description.
-     - Leave other sections empty — they will be filled during implementation.
-   - Record the workpad comment ID. All future updates use this single comment only.
-   - Proceed immediately to Step 1 (implementation). The orchestrator transitions to `{{ states.in_progress }}` automatically.
+   - Check how many plans are in `/workspace/.symphony/pending_plan.md`.
+   - If there are **multiple plans** (## Plan 1, ## Plan 2, etc.): write "플랜을 선택해주세요 (예: '1' 또는 'plan 2')" to `pending_plan.md` and exit. Do NOT implement.
+   - If there is a **single plan**: proceed with implementation.
+     - Create the Agent Workpad comment on the issue using the workpad template below.
+       - `### Plan`: fill in tasks derived from the selected/approved plan.
+       - `### Acceptance Criteria`: fill in from the issue description.
+       - Leave other sections empty — they will be filled during implementation.
+     - Record the workpad comment ID. All future updates use this single comment only.
+     - Proceed immediately to Step 1 (implementation). The orchestrator transitions to `{{ states.in_progress }}` automatically.
 2. For ALL other messages (no `✅`):
    - Write "✅ 리액션을 눌러야 구현을 시작합니다." to `pending_plan.md` and exit.
      (The orchestrator sends this back to Slack automatically.)
@@ -508,9 +511,9 @@ This step runs when a fix plan (from PR feedback or self-review) is approved.
    {% endif %}
    - After pushing, **always** write the PR info to `/workspace/.symphony/pr_created.json` (even if the PR already existed):
      ```json
-     {"pr_url": "<PR URL>", "pr_number": <PR number>, "base_commit": "<git rev-parse HEAD before any changes>"}
+     {"pr_url": "<PR URL>", "pr_number": <PR number>, "base_commit": "<value from pr_feedback.json base_commit field>"}
      ```
-     Capture `base_commit` by running `git rev-parse HEAD` **before** making any code changes in this session.
+     Read `base_commit` from `/workspace/.symphony/pr_feedback.json` — the orchestrator captured it before this session started. Do NOT run `git rev-parse HEAD` for `base_commit` in this case.
    - Attach PR URL to the issue. The orchestrator detects `pr_created.json` and transitions to `{{ states.in_review }}` automatically.
    - Leave a PR comment (in Korean) summarizing what was changed and why.
 

@@ -143,9 +143,10 @@ stateDiagram-v2
     [*] --> idea : 이슈 생성
 
     idea --> plan_review : 에이전트가 계획 작성
-    plan_review --> in_progress : Slack 승인
+    plan_review --> in_progress : ✅ 승인
+    plan_review --> idea : 피드백 (비승인)
 
-    in_progress --> in_review : 셀프 리뷰 후 오케스트레이터 전환
+    in_progress --> in_review : 셀프 리뷰 후 오케스트레이터 전환 / PR 생성
 
     in_review --> plan_review : 수정 계획 작성
     in_review --> done : PR 머지
@@ -157,10 +158,10 @@ stateDiagram-v2
 
 | 상태 전환 | 주체 | 트리거 |
 |-----------|------|--------|
-| 진행 예정 → 검토 중 | 에이전트 | 계획 작성 완료 |
-| 검토 중 → 진행 중 | 에이전트 | Slack 승인 수신 |
-| 진행 중 → 리뷰 중 | **오케스트레이터** | 셀프 리뷰 결과를 Slack에 전송 후 전환 |
-| 리뷰 중 → 리뷰 중 | 에이전트 | 셀프 리뷰 피드백 수신 → 리뷰 수정 후 오케스트레이터가 재전송 |
+| 진행 예정 → 검토 중 | **오케스트레이터** | 에이전트가 계획 작성 완료 (pending_plan.md 감지) |
+| 검토 중 → 진행 중 | **오케스트레이터** | Slack ✅ 승인 수신 |
+| 검토 중 → 진행 예정 | **오케스트레이터** | Slack 피드백 수신 (비승인) |
+| 진행 중 → 리뷰 중 | **오케스트레이터** | 셀프 리뷰 결과를 Slack에 전송 / PR 생성 |
 | 리뷰 중 → 검토 중 | 에이전트 | 셀프 리뷰 승인 → 수정 계획 작성 (수정할 이슈 있을 때) |
 | 리뷰 중 → 검토 중 | 에이전트 | PR 댓글 도착 → 수정 계획 작성 |
 | 리뷰 중 → 완료 | **오케스트레이터** | PR 머지 감지 |
@@ -393,6 +394,7 @@ flowchart TD
 | `pr_feedback.json` | OC → Agent | PR 댓글 목록. 에이전트가 읽고 수정 계획 수립 |
 | `pr_created.json` | Agent → OC | 에이전트가 PR 생성 후 작성. OC가 읽고 Slack 알림 전송 |
 | `review_sent` | OC 내부 | 리뷰 전송 여부 마커. 리뷰 응답과 계획 응답을 구분하는 데 사용 |
+| `phase.json` | OC 내부 | 현재 이슈 phase 영속화 (`{"phase":"..."`}). 오케스트레이터 재시작 시 복원용 |
 
 **에이전트에게 메시지 전달 방식:** `--continue -p "메시지"` 로 직접 전달. 파일 기반이 아님.
 
@@ -538,12 +540,12 @@ docker:
 # ── Slack 승인 워크플로우 ─────────────────────────────────────────────────
 slack:
   bot_token: $SLACK_BOT_TOKEN    # Slack Bot OAuth 토큰 (xoxb-...)
-  channel: $SLACK_CHANNEL_ID     # 알림을 보낼 채널 ID (C로 시작)
+  app_token: $SLACK_APP_TOKEN    # App-Level 토큰 (xapp-...) — Socket Mode 연결용
+  channel: $SLACK_CHANNEL_ID     # 본인 Slack 맴버 ID — DM으로 승인 알림 수신
 
-# ── 대시보드 (TUI) ────────────────────────────────────────────────────────
+# ── 관측 가능성 ───────────────────────────────────────────────────────────
 # observability:
-#   dashboard: true              # TTY에서 neo-blessed 대시보드 활성화 (기본 true, DASHBOARD=0으로 비활성화)
-#   refresh_interval_ms: 2000    # 대시보드 갱신 주기 (ms)
+#   refresh_interval_ms: 2000    # 내부 상태 갱신 주기 (ms, 기본 2초)
 
 # ── 내부 HTTP 서버 ────────────────────────────────────────────────────────
 # server:

@@ -58,7 +58,7 @@ import { z } from 'zod';
 
 /** 환경 변수에서 "$ENV_VAR" 토큰을 해석합니다. */
 function resolveEnv(value: string): string {
-  return value.replace(/\$([A-Z0-9_]+)/g, (_match, name: string) => {
+  return value.replace(/\$([A-Za-z0-9_]+)/g, (_match, name: string) => {
     const val = process.env[name];
     if (val === undefined) {
       throw new Error(`Environment variable $${name} is not set (referenced in config)`);
@@ -378,13 +378,6 @@ const rawConfigSchema = z.object({
   observability: observabilitySchema,
   server: serverSchema,
   slack: slackSchema,
-  /**
-   * PR 코드 리뷰 피드백을 수신하는 출처.
-   * 'pr' (기본값): GitHub/Bitbucket의 PR 댓글만 사용.
-   * 'slack': Slack 스레드 답글만 사용 (이슈가 in_review 상태일 때).
-   * 'both': 두 출처를 동시에 사용.
-   */
-  pr_feedback_source: z.enum(['pr', 'slack', 'both']).default('pr'),
 });
 
 /** `trackers`와 `agents`가 항상 채워진 완전히 파싱되고 검증된 설정. */
@@ -417,7 +410,6 @@ export const configSchema = rawConfigSchema.transform((raw) => {
     observability: raw.observability,
     server: raw.server,
     slack: raw.slack,
-    pr_feedback_source: raw.pr_feedback_source,
   };
 });
 

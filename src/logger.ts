@@ -4,7 +4,7 @@
  *   HH:MM:SS.mmm [level] message
  *   HH:MM:SS.mmm [level] message {"key":"value"}
  *
- * stderr에 출력 (Elixir Logger와 동일).
+ * error는 stderr, 나머지는 stdout에 출력.
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -61,6 +61,10 @@ function colorForIssue(identifier: string): string {
       hash = ((hash << 5) - hash + identifier.charCodeAt(i)) | 0;
     }
     color = ANSI_COLORS[Math.abs(hash) % ANSI_COLORS.length];
+    if (issueColorCache.size >= 500) {
+      const firstKey = issueColorCache.keys().next().value;
+      if (firstKey !== undefined) issueColorCache.delete(firstKey);
+    }
     issueColorCache.set(identifier, color);
   }
   return color;

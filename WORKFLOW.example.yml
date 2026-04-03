@@ -183,17 +183,6 @@ slack:
   app_token: $SLACK_APP_TOKEN    # App-Level Token (xapp-...) — Socket Mode 전용
   channel: $SLACK_CHANNEL_ID
 
-# ── Worker (SSH 원격 실행, 선택) ─────────────────────────────
-worker:
-  ssh_hosts:
-    - deploy@worker-01.internal
-    - deploy@worker-02.internal
-
-# ── Observability ────────────────────────────────────────────
-observability:
-  dashboard: true
-  refresh_interval_ms: 1000
-
 # ── Server ───────────────────────────────────────────────────
 server:
   port: 4000

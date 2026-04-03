@@ -218,11 +218,11 @@ export async function containerExists(name: string): Promise<boolean> {
   return result.status === 0;
 }
 
-function containerName(issue: Issue): string {
+function containerName(issue: Pick<Issue, 'identifier'>): string {
   return containerNameForIssue(issue);
 }
 
-export function containerNameForIssue(issue: Issue): string {
+export function containerNameForIssue(issue: Pick<Issue, 'identifier'>): string {
   const safe = issue.identifier.replace(/[^a-zA-Z0-9._-]/g, '_');
   return CONTAINER_PREFIX + safe;
 }

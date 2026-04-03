@@ -104,6 +104,6 @@ export class LocalWorkspaceBackend implements WorkspaceBackend {
   }
 }
 
-export function issueDir(issue: Issue): string {
+export function issueDir(issue: Pick<Issue, 'identifier'>): string {
   return issue.identifier.replace(/[^a-zA-Z0-9._-]/g, '_');
 }

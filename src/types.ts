@@ -157,6 +157,8 @@ export interface WorkspaceIO {
   writeFile(ref: WorkspaceRef, relativePath: string, content: string): Promise<void>;
   /** git diff 조회. base가 제공되면 해당 커밋에서 HEAD까지의 diff 반환; 없으면 전체 PR diff (origin/main...HEAD) 반환. */
   getDiff(ref: WorkspaceRef, base?: string): Promise<string | null>;
+  /** 현재 HEAD 커밋 해시 반환. git 저장소가 아니거나 실패 시 null. */
+  getCommitHash(ref: WorkspaceRef): Promise<string | null>;
   /** 워크스페이스 존재 여부 확인 (컨테이너 실행 중 / 디렉토리 존재). */
   exists(ref: WorkspaceRef): Promise<boolean>;
   /** 관리 중인 모든 워크스페이스 목록 반환. 이름 + 이슈 식별자 포함. */
@@ -164,9 +166,9 @@ export interface WorkspaceIO {
   /** 워크스페이스 이름에서 이슈 식별자 추출. */
   identifierFromName(name: string): string | null;
   /** 주어진 이슈의 워크스페이스 이름 도출. */
-  nameForIssue(issue: Issue): string;
+  nameForIssue(issue: Pick<Issue, 'identifier'>): string;
   /** 이슈에 대한 WorkspaceRef 생성 (워크스페이스를 실제로 만들지는 않음). */
-  refForIssue(issue: Issue): WorkspaceRef;
+  refForIssue(issue: Pick<Issue, 'identifier'>): WorkspaceRef;
   /** 워크스페이스 이름으로 WorkspaceRef 재구성 (nameForIssue의 역방향). */
   refFromName(name: string): WorkspaceRef;
 }

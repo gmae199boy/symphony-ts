@@ -112,6 +112,7 @@ export class Orchestrator extends EventEmitter {
 
   private running = new Map<string, RunningEntry>(); // issue.id → 엔트리
   private pendingDispatch = new Set<string>(); // identifier → 처리 중/디스패치 중
+  private retryTimers = new Set<ReturnType<typeof setTimeout>>(); // 재시도 타이머
   private issuePhases = new Map<string, IssuePhase>(); // identifier → 현재 phase
   private watchedIssues = new Map<string, Issue>(); // identifier → 마지막으로 알려진 Issue
   private queuedComments = new Map<string, { comments: Comment[]; prLabels: string[] }>(); // identifier → 큐에 쌓인 PR 댓글
@@ -198,6 +199,8 @@ export class Orchestrator extends EventEmitter {
 
   stop(): void {
     this.stopped = true;
+    for (const timer of this.retryTimers) clearTimeout(timer);
+    this.retryTimers.clear();
     this.trackerPoller?.stop();
     for (const p of this.repoPollers.values()) p.stop();
     this.humanChannel?.stop();
@@ -241,6 +244,8 @@ export class Orchestrator extends EventEmitter {
   async drainForSwap(gracePeriodMs = 120_000): Promise<TransferableState> {
     // 1. 폴러 정지 — 새 dispatch 차단
     this.stopped = true;
+    for (const timer of this.retryTimers) clearTimeout(timer);
+    this.retryTimers.clear();
     this.trackerPoller?.stop();
     for (const p of this.repoPollers.values()) p.stop();
 
@@ -558,7 +563,7 @@ export class Orchestrator extends EventEmitter {
     if (issue) {
       ref = this.io.refForIssue(issue);
     } else {
-      ref = this.io.refFromName(this.io.nameForIssue({ identifier } as Issue));
+      ref = this.io.refFromName(this.io.nameForIssue({ identifier }));
     }
     void this.io.writeFile(ref, '.symphony/phase.json', JSON.stringify({ phase })).catch(() => {});
   }
@@ -571,7 +576,7 @@ export class Orchestrator extends EventEmitter {
     if (issue) {
       ref = this.io.refForIssue(issue);
     } else {
-      ref = this.io.refFromName(this.io.nameForIssue({ identifier } as Issue));
+      ref = this.io.refFromName(this.io.nameForIssue({ identifier }));
     }
     void this.io.writeFile(ref, '.symphony/phase.json', '').catch(() => {});
   }
@@ -668,16 +673,19 @@ export class Orchestrator extends EventEmitter {
 
     // 이전 실행의 잔존 파일 방지 — 에이전트가 새로 쓴 것만 감지되도록 클리어
     const ref = this.io.refForIssue(issue);
-    void this.io.writeFile(ref, '.symphony/pending_plan.md', '').catch(() => {});
-    void this.io.writeFile(ref, '.symphony/pending_review.md', '').catch(() => {});
 
-    const promise = logContext.run({ identifier: issue.identifier }, () => runIssue(issue, this.tracker, this.config, this.promptTemplate, agents, {
+    const promise = logContext.run({ identifier: issue.identifier }, async () => {
+      await Promise.all([
+        this.io.writeFile(ref, '.symphony/pending_plan.md', ''),
+        this.io.writeFile(ref, '.symphony/pending_review.md', ''),
+      ]).catch(() => {});
+      return runIssue(issue, this.tracker, this.config, this.promptTemplate, agents, {
       trackerKind: this.trackerConfig.kind,
       repositoryKind: this.resolveRepository(issue)?.kind,
       repository: this.resolveRepository(issue),
       activeStates: this.trackerConfig.active_states,
       states: this.trackerConfig.states,
-      prFeedbackSource: this.config.pr_feedback_source,
+
       signal: abortController.signal,
       reason,
       resumeMessage,
@@ -700,7 +708,8 @@ export class Orchestrator extends EventEmitter {
           e.containerName = info.containerName ?? null;
         }
       },
-    }));
+    });
+    });
 
     this.running.set(issue.id, entry);
 
@@ -806,9 +815,12 @@ export class Orchestrator extends EventEmitter {
               if (activeNorm.includes(refreshed.state.toLowerCase().trim())) {
                 const delayMs = this.config.agents.retry_backoff_ms * Math.pow(2, retryCount);
                 logger.info(`Retrying ${issue.identifier} in ${delayMs}ms (retry ${retryCount + 1}/${maxRetries})`);
-                setTimeout(() => {
+                const timer = setTimeout(() => {
+                  this.retryTimers.delete(timer);
+                  if (this.stopped) return;
                   this.dispatch(refreshed, { reason: 'retry', retryCount: retryCount + 1, resumeMessage: '이전 실행이 실패했습니다. 현재 상태를 확인하고 작업을 이어서 진행하세요.' });
                 }, delayMs);
+                this.retryTimers.add(timer);
                 return;
               }
             }
@@ -899,10 +911,12 @@ export class Orchestrator extends EventEmitter {
           // tracker에서 찾을 수 없음 → 삭제된 이슈
           logger.info(`pruneStaleThreads: ${id} not found in tracker; removing thread`);
           this.humanChannel!.forgetThread(id);
+          this.clearPhase(id);
           pruned++;
         } else if (terminalNorm.has(issue.state.toLowerCase().trim())) {
           logger.info(`pruneStaleThreads: ${id} in terminal state "${issue.state}"; removing thread`);
           this.humanChannel!.forgetThread(id);
+          this.clearPhase(id);
           pruned++;
         }
       }
@@ -1474,6 +1488,14 @@ export class Orchestrator extends EventEmitter {
       const issue = await this.resolveIssueFromIdentifier(identifier, true);
       if (!issue) return;
 
+      // terminal state 이슈에 대한 응답 무시
+      const terminalNorm = new Set(this.trackerConfig.terminal_states.map((s) => s.toLowerCase().trim()));
+      if (terminalNorm.has(issue.state.toLowerCase().trim())) {
+        logger.info(`Human response for ${identifier}: issue in terminal state "${issue.state}"; ignoring`);
+        this.clearPhase(identifier);
+        return;
+      }
+
       const ref = this.io.refFromName(event.workspaceName);
       const currentPhase = this.issuePhases.get(identifier) ?? 'initial';
 
@@ -1504,12 +1526,6 @@ export class Orchestrator extends EventEmitter {
           break;
 
         case 'review_sent':
-          if (!event.isApproval && this.config.pr_feedback_source !== 'pr') {
-            // 비승인 + Slack PR 피드백 → pr_fixing
-            this.setPhase(identifier, 'pr_fixing');
-            await this.handleSlackPrFeedback(issue, event, ref);
-            return;
-          }
           this.setPhase(identifier, 'review_fixing');
           break;
 
@@ -1867,8 +1883,10 @@ export class Orchestrator extends EventEmitter {
   }
 
   private async writePrFeedback(ref: WorkspaceRef, comments: Comment[]): Promise<void> {
+    const base_commit = await this.io.getCommitHash(ref).catch(() => null);
     const payload = JSON.stringify({
       comments: this.serializeComments(comments),
+      base_commit,
       received_at: new Date().toISOString(),
     });
     await this.io.writeFile(ref, '.symphony/pr_feedback.json', payload);
@@ -1876,11 +1894,13 @@ export class Orchestrator extends EventEmitter {
 
   private async appendPrFeedback(ref: WorkspaceRef, newComments: Comment[]): Promise<void> {
     let existingEntries: Array<{ id: string; [key: string]: unknown }> = [];
+    let existingBaseCommit: string | null = null;
     try {
       const raw = await this.io.readFile(ref, '.symphony/pr_feedback.json');
       if (raw) {
         const parsed = JSON.parse(raw);
         existingEntries = Array.isArray(parsed.comments) ? parsed.comments : [];
+        existingBaseCommit = parsed.base_commit ?? null;
       }
     } catch { /* no existing file */ }
 
@@ -1889,8 +1909,12 @@ export class Orchestrator extends EventEmitter {
 
     const allEntries = [...existingEntries, ...this.serializeComments(deduped)];
 
+    // base_commit은 세션 최초 기록 시점의 값을 유지 (덮어쓰지 않음)
+    const base_commit = existingBaseCommit ?? await this.io.getCommitHash(ref).catch(() => null);
+
     const payload = JSON.stringify({
       comments: allEntries,
+      base_commit,
       received_at: new Date().toISOString(),
     });
     await this.io.writeFile(ref, '.symphony/pr_feedback.json', payload);

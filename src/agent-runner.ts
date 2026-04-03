@@ -46,8 +46,6 @@ export interface RunOptions {
   repository?: RepositoryConfig;
   /** Semantic state mapping for prompt template */
   states?: StatesConfig;
-  /** PR feedback source for WORKFLOW template variable */
-  prFeedbackSource?: string;
   /** Model override for this run (e.g. 'opus', 'sonnet') */
   model?: string;
   /** Host directory containing Claude Code auth/session files for per-developer credential injection. */
@@ -191,7 +189,6 @@ async function runAgentTurns(
     trackerKind: opts.trackerKind,
     repositoryKind: opts.repositoryKind,
     states: opts.states,
-    prFeedbackSource: opts.prFeedbackSource,
   });
 
   if (agentConfig.kind === 'claude') {

@@ -14,6 +14,9 @@ export class SshWorkspaceIO implements WorkspaceIO {
   getDiff(_ref: WorkspaceRef, _base?: string): Promise<string | null> {
     throw new Error('SSH workspace IO not yet implemented');
   }
+  getCommitHash(_ref: WorkspaceRef): Promise<string | null> {
+    throw new Error('SSH workspace IO not yet implemented');
+  }
   exists(_ref: WorkspaceRef): Promise<boolean> {
     throw new Error('SSH workspace IO not yet implemented');
   }
@@ -23,10 +26,10 @@ export class SshWorkspaceIO implements WorkspaceIO {
   identifierFromName(_name: string): string | null {
     throw new Error('SSH workspace IO not yet implemented');
   }
-  nameForIssue(_issue: Issue): string {
+  nameForIssue(_issue: Pick<Issue, 'identifier'>): string {
     throw new Error('SSH workspace IO not yet implemented');
   }
-  refForIssue(_issue: Issue): WorkspaceRef {
+  refForIssue(_issue: Pick<Issue, 'identifier'>): WorkspaceRef {
     throw new Error('SSH workspace IO not yet implemented');
   }
   refFromName(_name: string): WorkspaceRef {

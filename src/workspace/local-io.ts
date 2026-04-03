@@ -39,6 +39,14 @@ export class LocalWorkspaceIO implements WorkspaceIO {
     return proc.status === 0 ? proc.stdout : null;
   }
 
+  async getCommitHash(ref: WorkspaceRef): Promise<string | null> {
+    const proc = await spawnAsync('git', ['rev-parse', 'HEAD'], {
+      cwd: ref.workspace,
+      timeoutMs: 10_000,
+    });
+    return proc.status === 0 ? proc.stdout.trim() : null;
+  }
+
   async exists(ref: WorkspaceRef): Promise<boolean> {
     return fs.existsSync(ref.workspace);
   }
@@ -61,11 +69,11 @@ export class LocalWorkspaceIO implements WorkspaceIO {
     return name || null;
   }
 
-  nameForIssue(issue: Issue): string {
+  nameForIssue(issue: Pick<Issue, 'identifier'>): string {
     return issueDir(issue);
   }
 
-  refForIssue(issue: Issue): WorkspaceRef {
+  refForIssue(issue: Pick<Issue, 'identifier'>): WorkspaceRef {
     return { workspace: path.join(this.workspaceRoot, issueDir(issue)) };
   }
 

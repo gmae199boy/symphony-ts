@@ -9,7 +9,7 @@ COMMAND="${1:-}"
 
 build() {
   echo "==> Building..."
-  npm run build
+  pnpm run build
 }
 
 case "$COMMAND" in
@@ -26,7 +26,7 @@ case "$COMMAND" in
     build
 
     echo "==> Building Docker worker image (symphony-worker:latest)..."
-    npm run docker:build
+    pnpm run docker:build
 
     echo "==> Done. Run 'make start' to start symphony."
     ;;
@@ -42,7 +42,7 @@ case "$COMMAND" in
   start)
     build
     echo "==> Building Docker worker image (symphony-worker:latest)..."
-    npm run docker:build
+    pnpm run docker:build
     pm2 startOrRestart ecosystem.config.cjs
     ;;
 
@@ -62,8 +62,33 @@ case "$COMMAND" in
     pm2 status
     ;;
 
+  clean)
+    echo "==> 프로세스 정지 중..."
+    pm2 delete symphony 2>/dev/null || true
+    pm2 save 2>/dev/null || true
+
+    echo "==> 워크스페이스 삭제 중..."
+    rm -rf symphony-workspaces/
+
+    echo "==> symphony 컨테이너 제거 중..."
+    if command -v docker &>/dev/null; then
+      CONTAINERS=$(timeout 10 docker ps -a --filter "name=symphony-" -q 2>/dev/null || true)
+      if [[ -n "$CONTAINERS" ]]; then
+        echo "$CONTAINERS" | xargs timeout 30 docker rm -f || true
+      fi
+      echo "==> 컨테이너 정리 완료."
+    else
+      echo "==> Docker가 설치되어 있지 않습니다. 컨테이너 정리를 건너뜁니다."
+    fi
+
+    echo "==> 빌드 산출물 삭제 중..."
+    rm -rf dist/
+
+    echo "==> 초기화 완료. 로그(logs/)와 Docker 이미지는 유지됩니다."
+    ;;
+
   *)
-    echo "Usage: $0 {init|startup|start|stop|logs|reload|status}"
+    echo "Usage: $0 {init|startup|start|stop|logs|reload|status|clean}"
     exit 1
     ;;
 esac

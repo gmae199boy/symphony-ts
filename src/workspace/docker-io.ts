@@ -36,6 +36,15 @@ export class DockerWorkspaceIO implements WorkspaceIO {
     return proc.status === 0 ? proc.stdout : null;
   }
 
+  async getCommitHash(ref: WorkspaceRef): Promise<string | null> {
+    if (!ref.containerName) return null;
+    const proc = await spawnAsync('docker', [
+      'exec', '--user', 'worker', ref.containerName,
+      'bash', '-lc', 'cd /workspace && git rev-parse HEAD',
+    ], { timeoutMs: 10_000 });
+    return proc.status === 0 ? proc.stdout.trim() : null;
+  }
+
   async exists(ref: WorkspaceRef): Promise<boolean> {
     if (!ref.containerName) return false;
     return containerExists(ref.containerName);
@@ -52,11 +61,11 @@ export class DockerWorkspaceIO implements WorkspaceIO {
     return identifierFromContainerName(name);
   }
 
-  nameForIssue(issue: Issue): string {
+  nameForIssue(issue: Pick<Issue, 'identifier'>): string {
     return containerNameForIssue(issue);
   }
 
-  refForIssue(issue: Issue): WorkspaceRef {
+  refForIssue(issue: Pick<Issue, 'identifier'>): WorkspaceRef {
     return { workspace: '/workspace', containerName: containerNameForIssue(issue) };
   }
 

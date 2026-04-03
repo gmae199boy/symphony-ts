@@ -48,7 +48,7 @@ cp .env.example .env
 # Slack (계획 승인 워크플로우 사용 시)
 SLACK_BOT_TOKEN=       # xoxb-... — 메시지 전송용
 SLACK_APP_TOKEN=       # xapp-... — Socket Mode 연결용
-SLACK_CHANNEL_ID=      # C... — 승인 알림을 보낼 채널 ID
+SLACK_CHANNEL_ID=      # 본인 Slack 맴버 ID — DM으로 승인 알림 수신 (프로필 → ⋯ → 맴버 ID 복사)
 
 # Linear (Linear 트래커 사용 시)
 LINEAR_API_KEY=        # lin_api_...
@@ -182,7 +182,7 @@ trackers:
       canceled: 취소
 ```
 
-> **주의**: `states` 값은 실제 Linear/Jira에 설정된 상태 이름과 **정확히** 일치해야 한다.
+> **주의**: `states` 값은 실제 Linear/Jira에 설정된 상태 이름과 **정확히** 일치해야 한다. 상태 플로우는 [ARCHITECTURE.md](ARCHITECTURE.md) 참고.
 
 #### repository
 
@@ -198,7 +198,7 @@ trackers:
         before_run: git fetch origin             # 매 에이전트 실행 전
         after_run: rm -rf node_modules/.cache    # 매 에이전트 실행 후
         before_remove: echo "cleanup"            # 워크스페이스 제거 전
-        timeout_ms: 600000
+        timeout_ms: 300000       # 훅 타임아웃 (ms, 기본 5분)
 ```
 
 **Bitbucket:**
@@ -240,7 +240,8 @@ trackers:
 ```yaml
 agents:
   max_concurrent: 10           # 동시 실행 에이전트 수 (기본값: 10)
-  retry_backoff_ms: 5000
+  retry_backoff_ms: 5000       # 재시도 기본 백오프 (ms)
+  max_retries: 2               # 에이전트 실패 시 자동 재시도 횟수 (기본값: 2)
   review:
     rounds: 2                  # 에이전트당 리뷰 라운드 수
     kinds:
@@ -263,9 +264,19 @@ agents:
 
 ```yaml
 slack:
-  bot_token: $SLACK_BOT_TOKEN
-  app_token: $SLACK_APP_TOKEN
-  channel: $SLACK_CHANNEL_ID
+  bot_token: $SLACK_BOT_TOKEN   # xoxb-...
+  app_token: $SLACK_APP_TOKEN   # xapp-... (Socket Mode용)
+  channel: $SLACK_CHANNEL_ID    # 본인 Slack 맴버 ID
+```
+
+#### server
+
+내부 HTTP 서버 (헬스체크, webhook 수신 등):
+
+```yaml
+server:
+  port: 4000      # 기본값
+  host: 0.0.0.0   # 기본값
 ```
 
 #### docker (workspace_backend: docker 시)
@@ -295,7 +306,7 @@ Symphony는 **Socket Mode(WebSocket)**로 Slack과 통신한다. 공인 IP나 Re
 | Event Subscriptions | ON — Request URL 불필요 (Socket Mode가 수신) |
 | Socket Mode | ON — App-Level Token (`connections:write` scope) 발급 |
 
-> 알림을 받을 **채널** (공개: `C...`, 비공개: `G...`)에 봇을 초대해서 사용한다.
+> 봇에게 **DM**으로 승인 알림을 받는다. 채널 초대 없이 본인 맴버 ID만 설정하면 된다.
 
 ### 단계별 설정
 
@@ -337,16 +348,9 @@ Save Changes
 
 발급된 `xoxb-...` Bot OAuth Token을 `.env`의 `SLACK_BOT_TOKEN`에 저장
 
-**6. 채널에 봇 초대**
+**6. 본인 맴버 ID 확인**
 
-알림을 받을 Slack 채널에서:
-```
-/invite @봇이름
-```
-
-**7. 채널 ID 확인**
-
-해당 채널 클릭 → 채널 이름 클릭 → 상세 정보 하단에서 채널 ID 확인 (공개 채널: `C`로 시작, 비공개: `G`로 시작)
+Slack 앱 → 본인 프로필 클릭 → `⋯` (더보기) → **맴버 ID 복사**
 → `.env`의 `SLACK_CHANNEL_ID`에 저장
 
 ---
@@ -368,14 +372,8 @@ npm run docker:build
 # 의존성 설치
 pnpm install
 
-# 빌드
-npm run build
-
-# 실행
-npm start
-
 # 개발 모드 (빌드 없이 ts 직접 실행)
-npm run dev
+pnpm run dev
 ```
 
 ---

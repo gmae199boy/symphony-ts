@@ -13,7 +13,6 @@ export interface PromptExtras {
   trackerKind?: string;
   repositoryKind?: string;
   states?: StatesConfig;
-  prFeedbackSource?: string;
 }
 
 /**
@@ -36,7 +35,6 @@ export async function buildPrompt(
     tracker_kind: extras?.trackerKind ?? 'tracker',
     repository_kind: extras?.repositoryKind ?? 'github',
     states: extras?.states ?? {},
-    pr_feedback_source: extras?.prFeedbackSource ?? 'pr',
   };
 
   return engine.parseAndRender(template, context);

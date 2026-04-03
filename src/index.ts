@@ -154,7 +154,8 @@ async function main(): Promise<void> {
         return o;
       });
 
-      // 6. 재등록 + 시작
+      // 6. 기존 orchestrator 리스너 정리 후 재등록 + 시작
+      orchestrators.forEach((o) => o.removeAllListeners());
       newOrchestrators.forEach((o) => {
         registerOrchestratorEvents(o);
         o.start();

@@ -7,9 +7,9 @@
 # 원격 실행 전 .sync.env 파일을 설정해야 합니다. (.sync.env.example 참고)
 # =============================================================================
 
-.PHONY: init startup start stop logs reload status \
+.PHONY: init startup start stop logs reload status clean \
         remote-upload remote-init remote-startup remote-start \
-        remote-stop remote-logs remote-reload remote-status
+        remote-stop remote-logs remote-reload remote-status remote-clean
 
 # -----------------------------------------------------------------------------
 # 서버에서 직접 실행 (서버에 SSH 접속한 후 사용)
@@ -50,6 +50,11 @@ reload:
 ## pm2 프로세스 상태 확인 (uptime, restart 횟수, cpu/mem 등).
 status:
 	bash scripts/pm2.sh status
+
+## 프로세스 정지 후 워크스페이스, 컨테이너, pm2 등록을 모두 초기화.
+## 로그는 유지됨. Docker 이미지는 삭제하지 않음.
+clean:
+	bash scripts/pm2.sh clean
 
 # -----------------------------------------------------------------------------
 # 로컬에서 원격 실행 (.sync.env 설정 필요)
@@ -92,3 +97,7 @@ remote-reload:
 ## 원격 서버의 pm2 프로세스 상태 확인.
 remote-status:
 	bash scripts/remote.sh status
+
+## 원격 서버의 프로세스, 워크스페이스, 컨테이너 초기화.
+remote-clean:
+	bash scripts/remote.sh clean
