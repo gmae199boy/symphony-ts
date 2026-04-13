@@ -107,10 +107,8 @@ async function main(): Promise<void> {
       logger.error(`✗ Agent failed: ${issue.identifier}`, { error: String(err) });
     });
 
-    o.on('agent:message', (issueId: string, msg: AgentMessage) => {
-      if (msg.event.type === 'output') {
-        logger.debug(`[agent:${issueId}] ${msg.event.line}`);
-      }
+    o.on('agent:message', (_issueId: string, _msg: AgentMessage) => {
+      // raw JSON 로깅 비활성화 — 파싱된 semantic 로그는 claude.ts에서 출력됨
     });
   }
 
