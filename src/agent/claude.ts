@@ -94,6 +94,42 @@ function toolUseDetail(name: string, input?: Record<string, unknown>): string {
 }
 
 // ---------------------------------------------------------------------------
+// 에러 메시지 추출
+// ---------------------------------------------------------------------------
+
+/**
+ * Claude stream-json 출력에서 사람이 읽을 수 있는 에러 메시지를 추출합니다.
+ * type=result(is_error=true) → type=error → stderr 텍스트 순으로 시도합니다.
+ */
+function extractClaudeError(output: string): string {
+  const lines = output.split('\n');
+  // 뒤에서부터 탐색
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    try {
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+      // type=result + is_error=true: result 텍스트 반환
+      if (parsed.type === 'result' && parsed.is_error === true) {
+        const text = parsed.result as string | undefined;
+        if (text) return text.slice(0, 300);
+      }
+      // type=error: error.message 반환
+      if (parsed.type === 'error') {
+        const err = parsed.error as Record<string, unknown> | undefined;
+        if (err?.message) return String(err.message).slice(0, 300);
+      }
+    } catch { /* JSON이 아닌 줄은 건너뜁니다 */ }
+  }
+  // JSON 파싱 실패 시 마지막 비어있지 않은 줄 반환
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (line) return line.slice(0, 300);
+  }
+  return 'unknown error';
+}
+
+// ---------------------------------------------------------------------------
 // 프로세스 실행
 // ---------------------------------------------------------------------------
 
@@ -175,9 +211,7 @@ function spawnClaude(
               const detail = toolUseDetail(block.name as string, input);
               logger.debug(`[${containerCtx}] Tool: ${block.name}${detail}`, { issue: issueCtx(issue) });
             } else if (block.type === 'text' && typeof block.text === 'string' && block.text.trim()) {
-              // 에이전트 텍스트 출력 (처음 120자만 표시)
-              const preview = block.text.trim().slice(0, 120);
-              logger.debug(`[${containerCtx}] ${preview}`, { issue: issueCtx(issue) });
+              logger.debug(`[${containerCtx}] ${block.text.trim()}`, { issue: issueCtx(issue) });
             }
           }
         } else if (t === 'result') {
@@ -243,7 +277,7 @@ function spawnClaude(
         logger.warn(`Claude exited with code ${code} for ${issueCtx(issue)}`, {
           preview: output.slice(0, 500),
         });
-        reject(new Error(`Claude exited with code ${code}`));
+        reject(new Error(`Claude exited with code ${code}: ${extractClaudeError(output)}`));
       }
     });
 
