@@ -8,7 +8,7 @@ import { LocalWorkspaceIO } from './local-io.js';
 import { DockerWorkspaceBackend } from './docker.js';
 import { LocalWorkspaceBackend } from './local.js';
 import type { WorkspaceIO, WorkspaceBackend } from '../types.js';
-import type { Config, RepositoryConfig } from '../config/schema.js';
+import type { Config, RepositoryConfig, TrackerConfig } from '../config/schema.js';
 
 export function createWorkspaceIO(config: Config): WorkspaceIO {
   switch (config.workspace_backend) {
@@ -21,12 +21,16 @@ export function createWorkspaceIO(config: Config): WorkspaceIO {
   }
 }
 
-export function createWorkspaceBackend(config: Config, repository?: RepositoryConfig): WorkspaceBackend {
+export function createWorkspaceBackend(
+  config: Config,
+  repository?: RepositoryConfig,
+  trackerConfig?: TrackerConfig,
+): WorkspaceBackend {
   switch (config.workspace_backend) {
     case 'docker':
-      return new DockerWorkspaceBackend(config, repository);
+      return new DockerWorkspaceBackend(config, repository, trackerConfig);
     case 'local':
-      return new LocalWorkspaceBackend(config, repository);
+      return new LocalWorkspaceBackend(config, repository, trackerConfig);
     default:
       throw new Error(`Unknown workspace backend: ${config.workspace_backend}`);
   }

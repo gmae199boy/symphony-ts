@@ -9,16 +9,18 @@ import { logger } from '../logger.js';
 import { issueCtx } from '../utils.js';
 import { spawnAsync } from '../spawn-async.js';
 import type { Issue, WorkspaceRef, WorkspaceBackend } from '../types.js';
-import type { Config, RepositoryConfig } from '../config/schema.js';
+import type { Config, RepositoryConfig, TrackerConfig } from '../config/schema.js';
 import { buildCloneUrl } from './clone-url.js';
 
 export class LocalWorkspaceBackend implements WorkspaceBackend {
   private readonly config: Config;
   private readonly repository?: RepositoryConfig;
+  private readonly trackerConfig?: TrackerConfig;
 
-  constructor(config: Config, repository?: RepositoryConfig) {
+  constructor(config: Config, repository?: RepositoryConfig, trackerConfig?: TrackerConfig) {
     this.config = config;
     this.repository = repository;
+    this.trackerConfig = trackerConfig;
   }
 
   private get hooks() { return this.repository?.hooks; }

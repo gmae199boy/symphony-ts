@@ -19,7 +19,7 @@ import { issueCtx } from '../utils.js';
 import { shellEscape } from '../shell-utils.js';
 import { spawnAsync } from '../spawn-async.js';
 import type { Issue, WorkspaceRef, WorkspaceBackend } from '../types.js';
-import type { Config, RepositoryConfig } from '../config/schema.js';
+import type { Config, RepositoryConfig, TrackerConfig } from '../config/schema.js';
 import { buildCloneUrl } from './clone-url.js';
 
 const WORKSPACE_PATH = '/workspace';
@@ -39,10 +39,12 @@ const ENV_PASS_THROUGH = [
 export class DockerWorkspaceBackend implements WorkspaceBackend {
   private readonly config: Config;
   private readonly repository?: RepositoryConfig;
+  private readonly trackerConfig?: TrackerConfig;
 
-  constructor(config: Config, repository?: RepositoryConfig) {
+  constructor(config: Config, repository?: RepositoryConfig, trackerConfig?: TrackerConfig) {
     this.config = config;
     this.repository = repository;
+    this.trackerConfig = trackerConfig;
   }
 
   private get hooks() { return this.repository?.hooks; }
@@ -53,6 +55,7 @@ export class DockerWorkspaceBackend implements WorkspaceBackend {
 
     if (await containerExists(name)) {
       logger.debug(`Reusing existing container for ${issueCtx(issue)}`, { container: name });
+      await injectClaudeCredentials(name, this.config.docker.auth_mount);
       return { workspace: WORKSPACE_PATH, containerName: name };
     }
 
@@ -145,6 +148,24 @@ export class DockerWorkspaceBackend implements WorkspaceBackend {
       dockerArgs.push('-e', `${k}=${v}`);
     }
 
+    // 레포별 credentials를 표준 이름으로 주입 (멀티레포 시 레포 config 우선)
+    if (this.repository?.kind === 'bitbucket') {
+      if (this.repository.api_token) dockerArgs.push('-e', `BITBUCKET_API_TOKEN=${this.repository.api_token}`);
+      if (this.repository.email) dockerArgs.push('-e', `BITBUCKET_EMAIL=${this.repository.email}`);
+    } else if (this.repository?.kind === 'github') {
+      if (this.repository.token) dockerArgs.push('-e', `GITHUB_TOKEN=${this.repository.token}`);
+    }
+
+    // 트래커별 credentials를 표준 이름으로 주입 (멀티 트래커 시 트래커 config 우선)
+    if (this.trackerConfig?.kind === 'jira') {
+      const host = this.trackerConfig.host.replace(/\/$/, '');
+      dockerArgs.push('-e', `JIRA_HOST=${host}`);
+      if (this.trackerConfig.email) dockerArgs.push('-e', `JIRA_EMAIL=${this.trackerConfig.email}`);
+      if (this.trackerConfig.api_token) dockerArgs.push('-e', `JIRA_API_TOKEN=${this.trackerConfig.api_token}`);
+    } else if (this.trackerConfig?.kind === 'linear') {
+      if (this.trackerConfig.api_key) dockerArgs.push('-e', `LINEAR_API_KEY=${this.trackerConfig.api_key}`);
+    }
+
     dockerArgs.push(cfg.image, 'sleep', 'infinity');
 
     const result = await spawnAsync('docker', dockerArgs, { timeoutMs: 120_000 });
@@ -160,7 +181,7 @@ export class DockerWorkspaceBackend implements WorkspaceBackend {
     await injectClaudeCredentials(name, cfg.auth_mount);
 
     // credential.helper store를 통해 git 자격증명 주입 (git URL에 토큰 포함하지 않음).
-    await injectGitCredentials(name);
+    await injectGitCredentials(name, this.repository);
 
     // after_create 훅 (자격증명 주입 후, 클론 전에 실행 — 실패 시 치명적 오류)
     const afterCreate = this.hooks?.after_create;
@@ -227,15 +248,38 @@ export function containerNameForIssue(issue: Pick<Issue, 'identifier'>): string 
   return CONTAINER_PREFIX + safe;
 }
 
-/** 실행 중인 모든 symphony 컨테이너를 나열하고 이름을 반환합니다. */
+/** 모든 symphony 컨테이너를 나열하고 이름을 반환합니다 (중지된 컨테이너 포함). */
 export async function listSymphonyContainers(): Promise<string[]> {
   const result = await spawnAsync(
     'docker',
-    ['ps', '--filter', `name=${CONTAINER_PREFIX}`, '--format', '{{.Names}}'],
+    ['ps', '-a', '--filter', `name=${CONTAINER_PREFIX}`, '--format', '{{.Names}}'],
     { timeoutMs: 10_000 },
   );
   if (result.status !== 0) return [];
   return result.stdout.split('\n').map((s) => s.trim()).filter((s) => s !== '');
+}
+
+/** 컨테이너가 실행 중인지 확인합니다. */
+export async function isContainerRunning(name: string): Promise<boolean> {
+  const result = await spawnAsync(
+    'docker', ['inspect', '--format', '{{.State.Running}}', name],
+    { timeoutMs: 10_000 },
+  );
+  return result.status === 0 && result.stdout.trim() === 'true';
+}
+
+/** 중지된 컨테이너를 재시작합니다. */
+export async function restartStoppedContainer(name: string): Promise<boolean> {
+  const result = await spawnAsync('docker', ['start', name], { timeoutMs: 30_000 });
+  return result.status === 0;
+}
+
+/** 컨테이너 안의 잔존 claude 프로세스를 정리합니다. */
+export async function killClaudeProcesses(name: string): Promise<void> {
+  await spawnAsync(
+    'docker', ['exec', '--user', 'worker', name, 'bash', '-c', 'pkill -f "claude" || true'],
+    { timeoutMs: 10_000 },
+  );
 }
 
 /** 컨테이너 이름에서 이슈 식별자를 추출합니다 (containerNameForIssue의 역연산). */
@@ -253,6 +297,13 @@ export async function dockerExecRead(containerName: string, filePath: string): P
 }
 
 export async function dockerExecWrite(containerName: string, filePath: string, content: string): Promise<void> {
+  const dir = filePath.substring(0, filePath.lastIndexOf('/'));
+  if (dir) {
+    await spawnAsync(
+      'docker', ['exec', '--user', 'worker', containerName, 'mkdir', '-p', dir],
+      { timeoutMs: 5_000 },
+    );
+  }
   const result = await spawnAsync(
     'docker', ['exec', '--user', 'worker', '-i', containerName, 'bash', '-c', `cat > ${shellEscape(filePath)}`],
     { input: content, timeoutMs: 5_000 },
@@ -262,21 +313,31 @@ export async function dockerExecWrite(containerName: string, filePath: string, c
   }
 }
 
-async function injectGitCredentials(container: string): Promise<void> {
+async function injectGitCredentials(container: string, repository?: RepositoryConfig): Promise<void> {
   const lines: string[] = [];
 
-  // GitHub 자격증명
-  const ghToken = process.env['GITHUB_TOKEN'];
-  if (ghToken) {
-    lines.push(`https://oauth2:${ghToken}@github.com`);
+  // GitHub 자격증명: 레포 config 우선, 환경변수 폴백
+  if (repository?.kind === 'github') {
+    const token = repository.token ?? process.env['GITHUB_TOKEN'];
+    if (token) lines.push(`https://oauth2:${token}@github.com`);
+  } else {
+    const ghToken = process.env['GITHUB_TOKEN'];
+    if (ghToken) lines.push(`https://oauth2:${ghToken}@github.com`);
   }
 
-  // Bitbucket 자격증명
-  const bbToken = process.env['BITBUCKET_API_TOKEN'];
-
-  if (bbToken) {
-    const bbUser = process.env['BITBUCKET_EMAIL'] || 'x-token-auth';
-    lines.push(`https://${encodeURIComponent(bbUser)}:${encodeURIComponent(bbToken)}@bitbucket.org`);
+  // Bitbucket 자격증명: 레포 config 우선, 환경변수 폴백
+  if (repository?.kind === 'bitbucket') {
+    const token = repository.api_token ?? process.env['BITBUCKET_API_TOKEN'];
+    if (token) {
+      const user = repository.email || process.env['BITBUCKET_EMAIL'] || 'x-token-auth';
+      lines.push(`https://${encodeURIComponent(user)}:${encodeURIComponent(token)}@bitbucket.org`);
+    }
+  } else {
+    const bbToken = process.env['BITBUCKET_API_TOKEN'];
+    if (bbToken) {
+      const bbUser = process.env['BITBUCKET_EMAIL'] || 'x-token-auth';
+      lines.push(`https://${encodeURIComponent(bbUser)}:${encodeURIComponent(bbToken)}@bitbucket.org`);
+    }
   }
 
   if (lines.length === 0) {
@@ -306,7 +367,7 @@ async function injectGitCredentials(container: string): Promise<void> {
   }
 }
 
-async function injectClaudeCredentials(container: string, configuredAuthMount: string | undefined): Promise<void> {
+export async function injectClaudeCredentials(container: string, configuredAuthMount: string | undefined): Promise<void> {
   const json = readClaudeCredentials(configuredAuthMount);
   if (!json) {
     logger.warn('Claude credentials not found; container may not authenticate', { container });
