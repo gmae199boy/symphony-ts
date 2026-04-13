@@ -123,8 +123,6 @@ const bitbucketRepositorySchema = z.object({
 const baseRepositoryExtensions = {
   /** 이 저장소에 매핑되는 이슈 레이블. 다중 저장소 설정에서 사용합니다. */
   issue_labels: z.array(z.string()).default([]),
-  /** 레이블 일치 항목이 없을 때 이 저장소를 사용합니다 (다중 저장소 폴백). */
-  default: z.boolean().default(false),
 };
 
 export const repositorySchema = z.discriminatedUnion('kind', [

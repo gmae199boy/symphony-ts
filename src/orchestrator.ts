@@ -26,6 +26,7 @@ import { TrackerPoller } from './tracker/poller.js';
 import { LinearClient } from './tracker/linear.js';
 import { JiraClient } from './tracker/jira.js';
 import { createWorkspaceIO, createWorkspaceBackend } from './workspace/io.js';
+import { isContainerRunning, restartStoppedContainer, killClaudeProcesses, containerNameForIssue, injectClaudeCredentials } from './workspace/docker.js';
 import { SlackChannel } from './channel/slack.js';
 import type { FeedbackResponseEvent } from './types.js';
 import { spawn } from 'node:child_process';
@@ -38,7 +39,7 @@ import { parseDiffToFiles } from './slack/diff-parser.js';
 import type { Issue, TrackerClient, RepoEvent, AgentMessage, Comment, WorkspaceRef, WorkspaceIO, DispatchReason, IssuePhase } from './types.js';
 import type { Config, TrackerConfig, AgentConfig, ClaudeAgentConfig, CodexAgentConfig, RepositoryConfig } from './config/schema.js';
 
-const WAITING_PHASES: ReadonlySet<IssuePhase> = new Set(['plan_sent', 'pr_plan_sent', 'question_sent', 'review_sent']);
+const WAITING_PHASES: ReadonlySet<IssuePhase> = new Set(['plan_sent', 'pr_plan_sent', 'question_sent', 'review_sent', 'pr_fixing']);
 
 export interface RunningEntry {
   issue: Issue;
@@ -131,6 +132,7 @@ export class Orchestrator extends EventEmitter {
   private diffSender: DiffSender | null = null;
   private stopped = false;
   private lastThreadPruneAt = 0;
+  private credentialRefreshInterval: ReturnType<typeof setInterval> | null = null;
   private costCommentWritten = new Set<string>(); // identifier → 비용 댓글 작성 완료
   private agentLogStreams = new Map<string, fs.WriteStream>(); // identifier → log WriteStream
   private readonly logsDir: string;
@@ -179,6 +181,22 @@ export class Orchestrator extends EventEmitter {
     );
     this.trackerPoller.start();
     this.startRepoPoller();
+    this.startCredentialRefreshInterval();
+  }
+
+  /** 5분마다 모든 활성 컨테이너에 Claude 자격증명을 재주입한다. */
+  private startCredentialRefreshInterval(): void {
+    if (this.config.workspace_backend !== 'docker') return;
+    const authMount = this.config.docker?.auth_mount;
+    this.credentialRefreshInterval = setInterval(() => {
+      for (const entry of this.running.values()) {
+        const container = entry.containerName;
+        if (!container) continue;
+        void injectClaudeCredentials(container, authMount).catch((err) => {
+          logger.warn(`Failed to refresh credentials for ${entry.issue.identifier}`, { container, error: String(err) });
+        });
+      }
+    }, 5 * 60 * 1000);
   }
 
   /** 시작 시 미전송 diff 큐를 이어서 전송한다. */
@@ -201,6 +219,10 @@ export class Orchestrator extends EventEmitter {
     this.stopped = true;
     for (const timer of this.retryTimers) clearTimeout(timer);
     this.retryTimers.clear();
+    if (this.credentialRefreshInterval) {
+      clearInterval(this.credentialRefreshInterval);
+      this.credentialRefreshInterval = null;
+    }
     this.trackerPoller?.stop();
     for (const p of this.repoPollers.values()) p.stop();
     this.humanChannel?.stop();
@@ -308,21 +330,37 @@ export class Orchestrator extends EventEmitter {
   private async recoverFromWorkspaces(): Promise<void> {
     try {
       const workspaces = await this.io.list();
-      if (workspaces.length === 0) {
-        // 워크스페이스가 없어도 stale 스레드 정리는 실행
-        await this.pruneStaleThreads();
-        return;
+      const wsIdentifiers = new Set(workspaces.map((ws) => ws.identifier).filter(Boolean));
+
+      if (workspaces.length > 0) {
+        logger.info(`Recovery: found ${workspaces.length} existing workspace(s)`);
       }
 
-      logger.info(`Recovery: found ${workspaces.length} existing workspace(s)`);
-
       const terminalNorm = this.trackerConfig.terminal_states.map((s) => s.toLowerCase().trim());
+
+      // Docker 환경에서만 컨테이너 상태 관리
+      const isDocker = this.config.workspace_backend === 'docker';
 
       for (const ws of workspaces) {
         const identifier = ws.identifier;
         if (!identifier) continue;
 
         try {
+          // 컨테이너 상태 확인 및 복구 (Docker 백엔드)
+          if (isDocker) {
+            const running = await isContainerRunning(ws.name);
+            if (!running) {
+              logger.info(`Recovery: ${identifier} — container stopped, restarting`);
+              const started = await restartStoppedContainer(ws.name);
+              if (!started) {
+                logger.warn(`Recovery: ${identifier} — failed to restart container`);
+                continue;
+              }
+            }
+            // 이전 오케스트레이터 실행의 잔존 claude 프로세스 정리
+            await killClaudeProcesses(ws.name);
+          }
+
           const issue = await this.tracker.fetchIssueByIdentifier(identifier);
           if (!issue) {
             logger.info(`Recovery: ${identifier} not found in tracker; cleaning up thread`);
@@ -396,6 +434,42 @@ export class Orchestrator extends EventEmitter {
           this.dispatch(issue, { reason: 'recovery', resumeMessage: '시스템이 재시작되었습니다. 현재 상태를 확인하고 작업을 이어서 진행하세요.' });
         } catch (err) {
           logger.warn(`Recovery: failed to process workspace ${ws.name}`, { error: String(err) });
+        }
+      }
+
+      // 컨테이너 소실 감지: Slack 스레드는 있지만 워크스페이스가 없는 이슈
+      if (this.humanChannel) {
+        const watchedIds = this.humanChannel.getAllWatchedIdentifiers();
+        for (const id of watchedIds) {
+          if (wsIdentifiers.has(id)) continue; // 워크스페이스 있음 → 이미 처리됨
+
+          try {
+            const issue = await this.tracker.fetchIssueByIdentifier(id);
+            if (!issue) {
+              this.humanChannel.forgetThread(id);
+              this.clearPhase(id);
+              continue;
+            }
+
+            const stateNorm = issue.state.toLowerCase().trim();
+            if (terminalNorm.includes(stateNorm)) {
+              this.humanChannel.forgetThread(id);
+              this.clearPhase(id);
+              continue;
+            }
+
+            // active 상태인데 컨테이너가 없음 → 알림 후 phase만 초기화 (스레드는 유지)
+            logger.info(`Recovery: ${id} — container lost, notifying and resetting`);
+            await this.humanChannel.sendNotification(
+              issue,
+              `⚠️ *[${id}]* 컨테이너가 초기화되었습니다. 이전 작업 컨텍스트가 소실되어 마지막 체크포인트부터 재개합니다.`,
+            ).catch((err) => {
+              logger.warn(`Recovery: failed to notify container loss for ${id}`, { error: String(err) });
+            });
+            this.clearPhase(id);
+          } catch (err) {
+            logger.warn(`Recovery: failed to check lost container for ${id}`, { error: String(err) });
+          }
         }
       }
 
@@ -520,23 +594,17 @@ export class Orchestrator extends EventEmitter {
    * 주어진 이슈에 사용할 레포지토리를 결정한다 (멀티 레포 지원).
    * 우선순위: issue_labels 매칭 → 기본 레포 → 첫 번째 레포 → 단일 레포지토리 폴백.
    */
-  private resolveRepository(issue: Issue): RepositoryConfig | undefined {
+  private resolveRepository(issue: Issue): RepositoryConfig | null {
     const repos = this.trackerConfig.repositories ?? [];
-    if (repos.length === 0) return this.trackerConfig.repository;
+    if (repos.length === 0) return this.trackerConfig.repository ?? null;
+    if (repos.length === 1) return repos[0];
 
-    // 1. 이슈 레이블로 매칭
+    // 레포 2개 이상: 이슈 레이블로 매칭 필수
     const issueLabels = new Set(issue.labels.map((l) => l.toLowerCase()));
     const matched = repos.find((r) =>
       r.issue_labels.length > 0 && r.issue_labels.some((l) => issueLabels.has(l.toLowerCase())),
     );
-    if (matched) return matched;
-
-    // 2. 폴백: 기본 레포
-    const defaultRepo = repos.find((r) => r.default);
-    if (defaultRepo) return defaultRepo;
-
-    // 3. 폴백: 첫 번째 레포
-    return repos[0];
+    return matched ?? null;
   }
 
   // ---------------------------------------------------------------------------
@@ -614,7 +682,7 @@ export class Orchestrator extends EventEmitter {
 
   private dispatch(
     issue: Issue,
-    opts: { prLabels?: string[]; reason?: DispatchReason; retryCount?: number; resumeMessage?: string } = {},
+    opts: { prLabels?: string[]; reason?: DispatchReason; retryCount?: number; resumeMessage?: string; prFeedbackPayload?: string } = {},
   ): void {
     if (this.stopped) return;
     if (this.running.has(issue.id)) {
@@ -638,6 +706,24 @@ export class Orchestrator extends EventEmitter {
     if (agents.length === 0) {
       logger.info(`No matching agents for ${issue.identifier}; skipping dispatch`);
       if (acquiredSlot) this.limiter.release();
+      return;
+    }
+
+    // 레포 해석 — 멀티레포 시 라벨 매칭 필수
+    const resolvedRepo = this.resolveRepository(issue);
+    if (!resolvedRepo && (this.trackerConfig.repositories ?? []).length > 1) {
+      logger.warn(`No matching repository for ${issue.identifier}; skipping dispatch (check issue labels)`);
+      if (acquiredSlot) this.limiter.release();
+      if (this.humanChannel) {
+        const wsName = this.io.nameForIssue(issue);
+        void this.humanChannel.sendNotification(
+          issue,
+          `⚠️ *[${issue.identifier}]* 이슈 라벨이 설정되지 않았거나 매칭되는 레포가 없습니다. 이슈에 올바른 라벨을 추가해주세요.`,
+          wsName,
+        ).catch((err) => {
+          logger.warn(`Failed to notify label mismatch for ${issue.identifier}`, { error: String(err) });
+        });
+      }
       return;
     }
 
@@ -681,8 +767,9 @@ export class Orchestrator extends EventEmitter {
       ]).catch(() => {});
       return runIssue(issue, this.tracker, this.config, this.promptTemplate, agents, {
       trackerKind: this.trackerConfig.kind,
-      repositoryKind: this.resolveRepository(issue)?.kind,
-      repository: this.resolveRepository(issue),
+      repositoryKind: resolvedRepo?.kind,
+      repository: resolvedRepo ?? undefined,
+      trackerConfig: this.trackerConfig,
       activeStates: this.trackerConfig.active_states,
       states: this.trackerConfig.states,
 
@@ -691,6 +778,7 @@ export class Orchestrator extends EventEmitter {
       resumeMessage,
       model,
       claudeAuthDir,
+      prFeedbackPayload: opts.prFeedbackPayload,
       io: this.io,
       onMessage: (msg: AgentMessage) => this.handleAgentMessage(issue.id, msg),
       onTurnComplete: (info) => {
@@ -734,6 +822,7 @@ export class Orchestrator extends EventEmitter {
       void this.humanChannel.sendNotification(issue, text, workspaceName).catch((err) => {
         logger.warn(`Failed to send ${reason} notification for ${issue.identifier}`, { error: String(err) });
       });
+      this.logConversationToTracker(issue.id, '[Bot]', text);
     }
 
     const fullChain = promise
@@ -748,8 +837,11 @@ export class Orchestrator extends EventEmitter {
         this.trackWatchedIssue(issue);
         this.completedCount++;
         try {
-          // phase 기반 포스트프로세싱 — implementing 이후에는 plan/question 재전송 스킵
+          // phase 기반 포스트프로세싱
           const phase = this.issuePhases.get(issue.identifier) ?? 'initial';
+
+          // PR 생성 감지를 최우선으로 처리 (pr_created.json이 있으면 diff 전송 + 상태 전환)
+          await this.handlePrCreated(issue);
 
           if (phase === 'initial' || phase === 'pr_fixing' || phase === 'review_fixing') {
             // 계획/질문이 있으면 Slack에 보내고 종료 (셀프 리뷰보다 우선)
@@ -771,8 +863,6 @@ export class Orchestrator extends EventEmitter {
             if (reviewSent) return;
           }
           // phase === 'pr_fixing' 또는 isPrFixReason → handlePendingReview 완전 스킵
-
-          await this.handlePrCreated(issue);
           await this.notifyWorkComplete(issue);
           await this.clearPrFeedback(issue);
           if (!this.recentlyMerged.has(issue.identifier)) {
@@ -832,6 +922,14 @@ export class Orchestrator extends EventEmitter {
         this.clearPhase(issue.identifier);
         this.failedCount++;
         this.drainCommentQueue(issue.identifier);
+        if (this.humanChannel) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          const text = `:x: *[${issue.identifier}]* 에이전트 실패: ${errMsg}`;
+          void this.humanChannel.sendNotification(issue, text).catch((notifyErr) => {
+            logger.warn(`Failed to send failure notification for ${issue.identifier}`, { error: String(notifyErr) });
+          });
+          this.logConversationToTracker(issue.id, '[Bot]', text);
+        }
         this.emit('agent:failed', issue, err);
       });
 
@@ -1015,9 +1113,11 @@ export class Orchestrator extends EventEmitter {
 
     // 완료 알림 + 레코드 완전 삭제 (terminal에서만)
     if (this.humanChannel?.isWatching(issue.identifier)) {
-      await this.humanChannel.sendNotification(issue, `:white_check_mark: *${issue.identifier}* 작업 완료`).catch((err) => {
+      const completionText = `:white_check_mark: *${issue.identifier}* 작업 완료`;
+      await this.humanChannel.sendNotification(issue, completionText).catch((err) => {
         logger.warn(`Failed to send completion notification for ${issue.identifier}`, { error: String(err) });
       });
+      this.logConversationToTracker(issue.id, '[Bot]', completionText);
     }
     this.humanChannel?.forgetThread(issue.identifier);
 
@@ -1037,7 +1137,7 @@ export class Orchestrator extends EventEmitter {
     this.clearPhase(issue.identifier);
 
     try {
-      const backend = createWorkspaceBackend(this.config, this.resolveRepository(latest ?? issue));
+      const backend = createWorkspaceBackend(this.config, this.resolveRepository(latest ?? issue) ?? undefined, this.trackerConfig);
       const ref = this.io.refForIssue(issue);
       await backend.cleanup(ref, latest);
     } catch (err) {
@@ -1072,6 +1172,7 @@ export class Orchestrator extends EventEmitter {
     await this.humanChannel.sendNotification(issue, text, workspaceName).catch((err) => {
       logger.warn(`Failed to notify plan start for ${issue.identifier}`, { error: String(err) });
     });
+    this.logConversationToTracker(issue.id, '[Bot]', text);
   }
 
   private async handlePrCreated(issue: Issue): Promise<void> {
@@ -1092,10 +1193,13 @@ export class Orchestrator extends EventEmitter {
         const threadInfo = this.humanChannel.getThreadInfo(issue.identifier);
         if (threadInfo) {
           try {
+            logger.debug(`PR diff: base_commit=${data.base_commit ?? 'undefined'}`, { issue: issue.identifier });
             const rawDiff = await this.io.getDiff(ref, data.base_commit);
+            logger.debug(`PR diff: rawDiff length=${rawDiff?.length ?? 0}`, { issue: issue.identifier });
             if (rawDiff && rawDiff.trim()) {
               const files = parseDiffToFiles(rawDiff)
                 .filter(f => !/(?:^|\/)(package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$/.test(f.path));
+              logger.debug(`PR diff: ${files.length} files after filter`, { issue: issue.identifier });
               if (files.length > 0) {
                 this.diffQueueStore.set(issue.identifier, {
                   issueIdentifier: issue.identifier,
@@ -1113,11 +1217,17 @@ export class Orchestrator extends EventEmitter {
           } catch (err) {
             logger.warn(`Failed to send PR diff for ${issue.identifier}`, { error: String(err) });
           }
+        } else {
+          logger.debug(`PR diff: no threadInfo for ${issue.identifier}`);
         }
+      } else {
+        logger.debug(`PR diff: no diffSender for ${issue.identifier}`);
       }
 
       // PR URL 알림 (diff 전송 완료 후)
-      await this.humanChannel.sendNotification(issue, `🔗 *[${issue.identifier}]* PR이 생성되었습니다: ${data.pr_url}`);
+      const prNotifyText = `🔗 *[${issue.identifier}]* PR이 생성되었습니다: ${data.pr_url}`;
+      await this.humanChannel.sendNotification(issue, prNotifyText);
+      this.logConversationToTracker(issue.id, '[Bot]', prNotifyText);
     } catch (err) {
       logger.warn(`Failed to parse pr_created.json for ${issue.identifier}`, { error: String(err) });
     }
@@ -1147,6 +1257,12 @@ export class Orchestrator extends EventEmitter {
     await this.humanChannel.sendNotification(issue, text).catch((err) => {
       logger.warn(`Failed to notify work complete for ${issue.identifier}`, { error: String(err) });
     });
+    this.logConversationToTracker(issue.id, '[Bot]', text);
+  }
+
+  private logConversationToTracker(issueId: string, prefix: string, text: string): void {
+    this.tracker.createComment(issueId, `${prefix}\n\n${text}`)
+      .catch((err) => logger.warn('Failed to log conversation to tracker', { error: String(err) }));
   }
 
   // ---------------------------------------------------------------------------
@@ -1203,6 +1319,7 @@ export class Orchestrator extends EventEmitter {
 
     const wsName = this.io.nameForIssue(issue);
     const sent = await this.humanChannel.sendForApproval(issue, reviewText, 'review', wsName);
+    if (sent) this.logConversationToTracker(issue.id, '[Bot]', reviewText);
     if (!sent) return false;
 
     // phase 전환으로 재전송 방지 (pending_review.md는 유지 — 에이전트가 피드백/승인 시 참조)
@@ -1423,6 +1540,7 @@ export class Orchestrator extends EventEmitter {
     try {
       const wsName = this.io.nameForIssue(issue);
       const sent = await this.humanChannel.sendForApproval(issue, plan, 'plan', wsName);
+      if (sent) this.logConversationToTracker(issue.id, '[Bot]', plan);
       if (!sent) {
         logger.warn(`handlePendingPlan: sendForApproval returned false`, { issue: issue.identifier });
         return false;
@@ -1462,6 +1580,7 @@ export class Orchestrator extends EventEmitter {
     try {
       const wsName = this.io.nameForIssue(issue);
       const sent = await this.humanChannel.sendForApproval(issue, question, 'question', wsName);
+      if (sent) this.logConversationToTracker(issue.id, '[Bot]', question);
       if (!sent) return false;
 
       // question.md 비우기 (재전송 방지)
@@ -1481,6 +1600,8 @@ export class Orchestrator extends EventEmitter {
       logger.debug(`Human response for ${identifier}: agent running — skipping`);
       return;
     }
+
+    this.logConversationToTracker(event.issueId, '[User]', event.responseText);
 
     this.pendingDispatch.add(identifier);
     await logContext.run({ identifier }, async () => {
@@ -1682,6 +1803,17 @@ export class Orchestrator extends EventEmitter {
     prLabels: string[],
     comments: Comment[],
   ): Promise<void> {
+    // PR 댓글을 트래커에 기록
+    if (comments.length > 0) {
+      const issue = await this.resolveIssueFromIdentifier(identifier, false);
+      if (issue) {
+        const commentText = comments
+          .map((c) => `**${c.authorLogin}**${c.path ? ` (${c.path}:${c.line ?? ''})` : ''}:\n${c.body}`)
+          .join('\n\n---\n\n');
+        this.logConversationToTracker(issue.id, '[PR Comment]', commentText);
+      }
+    }
+
     // 케이스 1: 에이전트 실행 중 또는 디스패치 진행 중 → 나중을 위해 큐에 추가
     if (this.isRunningByIdentifier(identifier) || this.pendingDispatch.has(identifier)) {
       this.enqueueComments(identifier, prLabels, comments);
@@ -1707,8 +1839,18 @@ export class Orchestrator extends EventEmitter {
       });
 
       const ref = this.io.refForIssue(issue);
-      if (await this.io.exists(ref)) {
+      const containerReady = await this.io.exists(ref);
+
+      // 컨테이너가 있으면 직접 쓰기, 없으면 dispatch를 통해 컨테이너 생성 후 쓰기
+      let prFeedbackPayload: string | undefined;
+      if (containerReady) {
         await this.writePrFeedback(ref, comments);
+      } else {
+        prFeedbackPayload = JSON.stringify({
+          comments: this.serializeComments(comments),
+          base_commit: null,
+          received_at: new Date().toISOString(),
+        });
       }
 
       this.setPhase(identifier, 'pr_fixing');
@@ -1716,6 +1858,7 @@ export class Orchestrator extends EventEmitter {
         prLabels,
         reason: 'pr_feedback',
         resumeMessage: 'PR 피드백이 도착했습니다. .symphony/pr_feedback.json을 읽고 처리하세요.',
+        prFeedbackPayload,
       });
     } finally {
       this.pendingDispatch.delete(identifier);
@@ -1778,9 +1921,11 @@ export class Orchestrator extends EventEmitter {
 
       // 3. Notification + 레코드 완전 삭제
       if (this.humanChannel && issue) {
-        await this.humanChannel.sendNotification(issue, `:merged: *${identifier}* PR이 머지되어 작업이 완료되었습니다.`).catch((err) => {
+        const mergeText = `:merged: *${identifier}* PR이 머지되어 작업이 완료되었습니다.`;
+        await this.humanChannel.sendNotification(issue, mergeText).catch((err) => {
           logger.warn(`Failed to send merge notification for ${identifier}`, { error: String(err) });
         });
+        this.logConversationToTracker(issue.id, '[Bot]', mergeText);
         this.humanChannel.forgetThread(identifier);
       }
 

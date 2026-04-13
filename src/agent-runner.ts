@@ -17,7 +17,7 @@ import { createAgentBackend } from './agent/factory.js';
 import { createWorkspaceBackend } from './workspace/io.js';
 import { injectClaudeCredentialsFromDir } from './workspace/docker.js';
 import type { Issue, AgentBackend, WorkspaceBackend, WorkspaceRef, WorkspaceIO, AgentMessageHandler, TrackerClient, DispatchReason } from './types.js';
-import type { Config, AgentConfig, RepositoryConfig, StatesConfig } from './config/schema.js';
+import type { Config, AgentConfig, RepositoryConfig, StatesConfig, TrackerConfig } from './config/schema.js';
 
 export interface RunOptions {
   workerHost?: string;
@@ -44,12 +44,16 @@ export interface RunOptions {
   io?: WorkspaceIO;
   /** Repository config for auto-clone */
   repository?: RepositoryConfig;
+  /** Tracker config — used for per-tracker env injection (e.g., JIRA_HOST) */
+  trackerConfig?: TrackerConfig;
   /** Semantic state mapping for prompt template */
   states?: StatesConfig;
   /** Model override for this run (e.g. 'opus', 'sonnet') */
   model?: string;
   /** Host directory containing Claude Code auth/session files for per-developer credential injection. */
   claudeAuthDir?: string;
+  /** PR feedback payload to write to .symphony/pr_feedback.json after container creation */
+  prFeedbackPayload?: string;
 }
 
 export interface RuntimeInfo {
@@ -118,12 +122,17 @@ async function runOnWorkerHost(
     `Starting worker attempt for ${issueCtx(issue)} worker_host=${workerHost ?? 'local'}`,
   );
 
-  const workspaceBackend = createWorkspaceBackend(config, opts.repository);
+  const workspaceBackend = createWorkspaceBackend(config, opts.repository, opts.trackerConfig);
   const ref = await workspaceBackend.create(issue, workerHost ?? undefined);
 
   // Per-developer Claude auth override: re-inject credentials from the specified directory.
   if (opts.claudeAuthDir && ref.containerName) {
     await injectClaudeCredentialsFromDir(ref.containerName, opts.claudeAuthDir);
+  }
+
+  // PR feedback 파일 쓰기 (컨테이너 생성 후, 에이전트 실행 전)
+  if (opts.prFeedbackPayload && opts.io) {
+    await opts.io.writeFile(ref, '.symphony/pr_feedback.json', opts.prFeedbackPayload);
   }
 
   opts.onRuntimeInfo?.({
