@@ -87,7 +87,9 @@ trackers:
       - kind: bitbucket
         workspace: my-org
         repo_slug: frontend
-        api_token: $BITBUCKET_API_TOKEN   # 워크스페이스 토큰: BITBUCKET_EMAIL 불필요
+        api_token: $BITBUCKET_API_TOKEN
+        email: $BITBUCKET_EMAIL           # REST API용 Atlassian 계정 이메일 (개인 API 토큰 사용 시)
+        username: $BITBUCKET_USERNAME     # git clone용 Bitbucket username (nickname)
         poll_interval_ms: 30000
         event_source: polling
         issue_labels: [frontend]          # Jira 이슈에 'frontend' 라벨 → 이 레포

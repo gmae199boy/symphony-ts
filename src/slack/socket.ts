@@ -16,6 +16,7 @@
 import { z } from 'zod';
 import { logger } from '../logger.js';
 import { fetchWithRetry } from '../fetch-retry.js';
+import { sendSlackMessage } from './notifier.js';
 import type { SlackThreadManager } from './thread-store.js';
 
 // ---------------------------------------------------------------------------
@@ -91,6 +92,7 @@ export class SlackSocketReceiver {
   private ws: WebSocket | null = null;
   private botUserId: string | null = null;
   private stopped = false;
+  private connecting = false;
   private backoffMs = BACKOFF_INITIAL_MS;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -134,36 +136,44 @@ export class SlackSocketReceiver {
 
   private async connect(): Promise<void> {
     if (this.stopped) return;
+    if (this.connecting) return;
+    this.connecting = true;
 
-    const wsUrl = await this.openConnection();
-    if (!wsUrl) {
-      this.scheduleReconnect();
-      return;
-    }
-
-    const ws = new WebSocket(wsUrl);
-    this.ws = ws;
-
-    ws.onmessage = (ev: MessageEvent) => {
-      try {
-        this.handleRawMessage(typeof ev.data === 'string' ? ev.data : String(ev.data));
-      } catch (err) {
-        logger.error('Slack socket: message handler error', { error: String(err) });
+    try {
+      const wsUrl = await this.openConnection();
+      if (!wsUrl) {
+        this.scheduleReconnect();
+        return;
       }
-    };
 
-    ws.onclose = (ev: Event & { code?: number; reason?: string }) => {
       if (this.stopped) return;
-      logger.warn('Slack socket: connection closed', { code: ev.code, reason: ev.reason });
-      this.ws = null;
-      this.scheduleReconnect();
-    };
 
-    ws.onerror = (ev: Event) => {
-      if (this.stopped) return;
-      logger.warn('Slack socket: connection error', { error: String(ev) });
-      // onclose will fire after onerror, so no need to reconnect here
-    };
+      const ws = new WebSocket(wsUrl);
+      this.ws = ws;
+
+      ws.onmessage = (ev: MessageEvent) => {
+        try {
+          this.handleRawMessage(typeof ev.data === 'string' ? ev.data : String(ev.data));
+        } catch (err) {
+          logger.error('Slack socket: message handler error', { error: String(err) });
+        }
+      };
+
+      ws.onclose = (ev: Event & { code?: number; reason?: string }) => {
+        if (this.stopped) return;
+        logger.warn('Slack socket: connection closed', { code: ev.code, reason: ev.reason });
+        this.ws = null;
+        this.scheduleReconnect();
+      };
+
+      ws.onerror = (ev: Event) => {
+        if (this.stopped) return;
+        logger.warn('Slack socket: connection error', { error: String(ev) });
+        // onclose will fire after onerror, so no need to reconnect here
+      };
+    } finally {
+      this.connecting = false;
+    }
   }
 
   private scheduleReconnect(): void {
@@ -247,7 +257,8 @@ export class SlackSocketReceiver {
       logger.info('Slack socket: disconnect requested by Slack, reconnecting');
       this.ws?.close();
       this.ws = null;
-      void this.connect();
+      this.resetBackoff();
+      this.scheduleReconnect();
       return;
     }
 
@@ -321,6 +332,17 @@ export class SlackSocketReceiver {
       if (watched.approvedByReaction) continue;
       if (watched.threadInfo.channel !== channel) continue;
       if (watched.approvalMessageTs !== reactionTs) continue;
+
+      if (watched.pendingPlanCount > 1) {
+        logger.info(`Slack socket: ✅ reaction blocked — multi-plan for ${watched.issueIdentifier}`);
+        void sendSlackMessage(
+          this.botToken,
+          channel,
+          '계획 번호를 입력하거나 피드백을 주세요 (예: 1, 2, 3)',
+          watched.threadInfo.thread_ts,
+        );
+        return;
+      }
 
       logger.info(`Slack socket: ✅ reaction for ${watched.issueIdentifier}`);
       this.threadManager.markApprovedByReaction(watched.issueIdentifier);

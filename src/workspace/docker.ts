@@ -56,6 +56,7 @@ export class DockerWorkspaceBackend implements WorkspaceBackend {
     if (await containerExists(name)) {
       logger.debug(`Reusing existing container for ${issueCtx(issue)}`, { container: name });
       await injectClaudeCredentials(name, this.config.docker.auth_mount);
+      await injectGitCredentials(name, this.repository);
       return { workspace: WORKSPACE_PATH, containerName: name };
     }
 
@@ -194,7 +195,8 @@ export class DockerWorkspaceBackend implements WorkspaceBackend {
     if (this.repository) {
       const cloneUrl = buildCloneUrl(this.repository);
       logger.info(`Cloning ${cloneUrl} into container ${name}`);
-      await dockerExec(name, `git clone --depth 1 ${cloneUrl} .`, this.hookTimeoutMs);
+      const cloneCmd = `if [ -d .git ]; then echo 'already cloned'; else find . -mindepth 1 -delete 2>/dev/null || true; git clone --depth 1 ${shellEscape(cloneUrl)} .; fi`;
+      await dockerExec(name, cloneCmd, this.hookTimeoutMs);
 
       // .claude/skills를 워크스페이스에 심볼릭 링크 (마운트 경로: /home/worker/.claude/skills)
       await dockerExec(name, `mkdir -p /workspace/.claude && test -d /home/worker/.claude/skills && ln -sf /home/worker/.claude/skills /workspace/.claude/skills || true`, 30_000);
@@ -325,18 +327,20 @@ async function injectGitCredentials(container: string, repository?: RepositoryCo
     if (ghToken) lines.push(`https://oauth2:${ghToken}@github.com`);
   }
 
-  // Bitbucket 자격증명: 레포 config 우선, 환경변수 폴백
+  // Bitbucket 자격증명: git clone용 username 우선, 없으면 x-token-auth (Repository Access Token용).
   if (repository?.kind === 'bitbucket') {
     const token = repository.api_token ?? process.env['BITBUCKET_API_TOKEN'];
     if (token) {
-      const user = repository.email || process.env['BITBUCKET_EMAIL'] || 'x-token-auth';
-      lines.push(`https://${encodeURIComponent(user)}:${encodeURIComponent(token)}@bitbucket.org`);
+      const username = repository.username ?? process.env['BITBUCKET_USERNAME'];
+      const user = username ? encodeURIComponent(username) : 'x-token-auth';
+      lines.push(`https://${user}:${encodeURIComponent(token)}@bitbucket.org`);
     }
   } else {
     const bbToken = process.env['BITBUCKET_API_TOKEN'];
     if (bbToken) {
-      const bbUser = process.env['BITBUCKET_EMAIL'] || 'x-token-auth';
-      lines.push(`https://${encodeURIComponent(bbUser)}:${encodeURIComponent(bbToken)}@bitbucket.org`);
+      const bbUsername = process.env['BITBUCKET_USERNAME'];
+      const user = bbUsername ? encodeURIComponent(bbUsername) : 'x-token-auth';
+      lines.push(`https://${user}:${encodeURIComponent(bbToken)}@bitbucket.org`);
     }
   }
 
@@ -358,13 +362,10 @@ async function injectGitCredentials(container: string, repository?: RepositoryCo
   );
 
   if (result.status !== 0) {
-    logger.warn('Failed to inject git credentials into container', {
-      container,
-      stderr: result.stderr?.trim().slice(0, 200),
-    });
-  } else {
-    logger.info('Injected git credentials into container', { container });
+    const stderr = result.stderr?.trim().slice(0, 200) ?? '';
+    throw new Error(`Failed to inject git credentials into container (exit ${result.status}): ${stderr}`);
   }
+  logger.info('Injected git credentials into container', { container });
 }
 
 export async function injectClaudeCredentials(container: string, configuredAuthMount: string | undefined): Promise<void> {

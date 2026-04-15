@@ -21,8 +21,8 @@
 ```bash
 pnpm install
 cp .env.example .env   # 토큰 입력
-npm run build
-npm start
+pnpm run build
+pnpm start
 ```
 
 ## 문서

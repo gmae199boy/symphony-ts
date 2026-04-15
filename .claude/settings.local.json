@@ -22,7 +22,10 @@
       "Bash(pnpm build:*)",
       "mcp__context7__resolve-library-id",
       "mcp__context7__query-docs",
-      "mcp__sequential-thinking__sequentialthinking"
+      "mcp__sequential-thinking__sequentialthinking",
+      "WebFetch(domain:support.atlassian.com)",
+      "WebFetch(domain:status.anthropic.com)",
+      "WebFetch(domain:status.claude.com)"
     ]
   }
 }

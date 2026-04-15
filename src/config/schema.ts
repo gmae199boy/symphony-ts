@@ -110,8 +110,10 @@ const bitbucketRepositorySchema = z.object({
   kind: z.literal('bitbucket'),
   workspace: envString,
   repo_slug: envString,
-  /** Bitbucket 개인 API 토큰 사용 시 필수 — Basic(이메일:토큰) 인증. 워크스페이스 토큰만 사용할 경우 생략 가능. */
+  /** REST API Basic Auth용 Atlassian 계정 이메일. 워크스페이스 토큰만 사용할 경우 생략 가능. */
   email: optionalEnvString,
+  /** git clone용 Bitbucket 계정 username (nickname). 미설정 시 x-token-auth 사용 (Repository Access Token용). */
+  username: optionalEnvString,
   api_token: optionalEnvString,
   poll_interval_ms: z.number().int().positive().default(30_000),
   pr_label_filter: z.string().optional(),

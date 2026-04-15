@@ -89,7 +89,24 @@ BITBUCKET_API_TOKEN=   # Bitbucket API 토큰
 | 개인 API Token | Personal settings → API tokens | 본인 계정 이름 | 필요 |
 | 워크스페이스 토큰 | Workspace settings → Access tokens | 토큰 이름 (봇처럼 표시) | 불필요 |
 
-→ 필요 권한: Repositories(Read), Pull requests(Read/Write)
+> **중요**: 토큰 생성 시 반드시 **스코프(권한 범위)를 직접 선택**해야 한다. 스코프 없이 생성된 토큰은 API 호출이 거부된다.
+
+**필요 스코프:**
+
+| 스코프 | 용도 |
+|--------|------|
+| `Repositories` → **Read** | 레포 정보 조회, clone |
+| `Repositories` → **Write** | 브랜치 push |
+| `Pull requests` → **Read** | PR 목록/상세 조회 |
+| `Pull requests` → **Write** | PR 생성, 댓글 작성 |
+
+**개인 API Token 발급:**
+→ bitbucket.org → 우측 상단 프로필 → Personal Bitbucket settings → **API tokens**
+→ Create API token → 이름 입력 → 위 스코프 체크 → Create
+
+**워크스페이스 토큰 발급:**
+→ bitbucket.org → 워크스페이스 선택 → Settings → **Access tokens**
+→ Create Repository Access Token → 이름 입력 → 위 스코프 체크 → Create
 
 **Slack 토큰** → [아래 섹션](#4-slack-앱-설정) 참고
 
@@ -194,7 +211,7 @@ trackers:
       pr_label_filter: symphony      # 이 레이블이 있는 PR만 추적 (기본값: symphony)
       hooks:
         after_create: pnpm install -g typescript  # 컨테이너/디렉토리 생성 직후
-        after_clone: npm ci                      # clone 후 실행
+        after_clone: pnpm install                 # clone 후 실행
         before_run: git fetch origin             # 매 에이전트 실행 전
         after_run: rm -rf node_modules/.cache    # 매 에이전트 실행 후
         before_remove: echo "cleanup"            # 워크스페이스 제거 전
@@ -301,8 +318,8 @@ Symphony는 **Socket Mode(WebSocket)**로 Slack과 통신한다. 공인 IP나 Re
 
 | 항목 | 값 |
 |------|----|
-| Bot Token Scopes | `chat:write`, `channels:history`, `groups:history`, `reactions:read` |
-| Subscribe to bot events | `message.channels` (또는 `message.groups`), `reaction_added` |
+| Bot Token Scopes | `chat:write`, `channels:history`, `groups:history`, `im:history`, `reactions:read` |
+| Subscribe to bot events | `message.channels` (또는 `message.groups`), `message.im`, `reaction_added` |
 | Event Subscriptions | ON — Request URL 불필요 (Socket Mode가 수신) |
 | Socket Mode | ON — App-Level Token (`connections:write` scope) 발급 |
 
@@ -327,6 +344,7 @@ App-Level Tokens → Generate → 이름 입력 → scope: `connections:write` �
 - `chat:write`
 - `channels:history` — 공개 채널 메시지 수신용
 - `groups:history` — 비공개 채널 사용 시 추가
+- `im:history` — 봇 DM으로 승인 메시지 수신용
 - `reactions:read`
 
 **4. Event Subscriptions 활성화 + bot events 구독**
@@ -338,6 +356,7 @@ App-Level Tokens → Generate → 이름 입력 → scope: `connections:write` �
 Subscribe to bot events → Add Bot User Event:
 - `message.channels` — 공개 채널 스레드 답글 수신
 - `message.groups` — 비공개 채널 사용 시 추가
+- `message.im` — 봇 DM으로 사용자 → 봇 메시지 수신 (계획 승인 등)
 - `reaction_added` — ✅ 리액션 수신
 
 Save Changes
@@ -361,7 +380,7 @@ Slack 앱 → 본인 프로필 클릭 → `⋯` (더보기) → **맴버 ID 복�
 
 수동으로 빌드하려면:
 ```bash
-npm run docker:build
+pnpm run docker:build
 ```
 
 ---

@@ -11,6 +11,7 @@ import { spawnAsync } from '../spawn-async.js';
 import type { Issue, WorkspaceRef, WorkspaceBackend } from '../types.js';
 import type { Config, RepositoryConfig, TrackerConfig } from '../config/schema.js';
 import { buildCloneUrl } from './clone-url.js';
+import { shellEscape } from '../shell-utils.js';
 
 export class LocalWorkspaceBackend implements WorkspaceBackend {
   private readonly config: Config;
@@ -47,7 +48,8 @@ export class LocalWorkspaceBackend implements WorkspaceBackend {
       if (this.repository) {
         const cloneUrl = buildCloneUrl(this.repository);
         logger.info(`Cloning ${cloneUrl} into ${workspacePath}`);
-        const cloneResult = await spawnAsync('bash', ['-lc', `git clone --depth 1 ${cloneUrl} .`], {
+        const cloneCmd = buildLocalCloneCommand(cloneUrl, this.repository);
+        const cloneResult = await spawnAsync('bash', ['-lc', cloneCmd], {
           cwd: workspacePath, timeoutMs: this.hookTimeoutMs,
         });
         if (cloneResult.status !== 0) {
@@ -108,4 +110,23 @@ export class LocalWorkspaceBackend implements WorkspaceBackend {
 
 export function issueDir(issue: Pick<Issue, 'identifier'>): string {
   return issue.identifier.replace(/[^a-zA-Z0-9._-]/g, '_');
+}
+
+/**
+ * Builds a git clone command that passes credentials via an inline credential helper,
+ * without embedding them in the URL or modifying the global ~/.git-credentials.
+ */
+function buildLocalCloneCommand(cloneUrl: string, repository: RepositoryConfig): string {
+  if (repository.kind === 'bitbucket') {
+    const token = repository.api_token ?? process.env['BITBUCKET_API_TOKEN'];
+    if (token) {
+      const raw = repository.username ?? process.env['BITBUCKET_USERNAME'];
+      const user = raw ? encodeURIComponent(raw) : 'x-token-auth';
+      const pass = encodeURIComponent(token);
+      // Inline credential helper — one-shot, does not modify global git config.
+      const helper = `!f() { echo username=${user}; echo password=${pass}; }; f`;
+      return `git -c ${shellEscape(`credential.helper=${helper}`)} clone --depth 1 ${shellEscape(cloneUrl)} .`;
+    }
+  }
+  return `git clone --depth 1 ${shellEscape(cloneUrl)} .`;
 }

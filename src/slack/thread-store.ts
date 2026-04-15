@@ -29,6 +29,8 @@ export interface WatchedThread {
   planNumber: number;
   approvalMessageTs: string | null;
   approvedByReaction: boolean;
+  /** 현재 승인 대기 중인 계획 수. 1 = 단일, >1 = 복수 선택 필요. */
+  pendingPlanCount: number;
   /** false = stop watching, but keep thread routing info */
   active: boolean;
 }
@@ -47,6 +49,7 @@ const ThreadRecordSchema = z.object({
   planNumber: z.number().default(0),
   approvalMessageTs: z.string().nullable().default(null),
   approvedByReaction: z.boolean().default(false),
+  pendingPlanCount: z.number().default(1),
   /** false = 폴링 중지, 스레드 라우팅 정보는 유지 */
   active: z.boolean().default(true),
 });
@@ -118,6 +121,7 @@ export class SlackThreadManager {
         planNumber: record.planNumber,
         approvalMessageTs: record.approvalMessageTs,
         approvedByReaction: record.approvedByReaction,
+        pendingPlanCount: record.pendingPlanCount,
         active: record.active,
       });
     }
@@ -145,6 +149,7 @@ export class SlackThreadManager {
       planNumber: existing?.planNumber ?? 0,
       approvalMessageTs: null,
       approvedByReaction: false,
+      pendingPlanCount: 1,
       active: true,
     });
 
@@ -204,6 +209,13 @@ export class SlackThreadManager {
     this.persist();
   }
 
+  setPendingPlanCount(issueIdentifier: string, count: number): void {
+    const w = this.threads.get(issueIdentifier);
+    if (!w) return;
+    w.pendingPlanCount = count;
+    this.persist();
+  }
+
   markApprovedByReaction(issueIdentifier: string): void {
     const w = this.threads.get(issueIdentifier);
     if (!w) return;
@@ -242,6 +254,7 @@ export class SlackThreadManager {
         planNumber: w.planNumber,
         approvalMessageTs: w.approvalMessageTs,
         approvedByReaction: w.approvedByReaction,
+        pendingPlanCount: w.pendingPlanCount,
         active: w.active,
       });
     }
