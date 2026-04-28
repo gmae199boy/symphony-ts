@@ -11,7 +11,7 @@ export class SshWorkspaceIO implements WorkspaceIO {
   writeFile(_ref: WorkspaceRef, _relativePath: string, _content: string): Promise<void> {
     throw new Error('SSH workspace IO not yet implemented');
   }
-  getDiff(_ref: WorkspaceRef, _base?: string): Promise<string | null> {
+  getDiff(_ref: WorkspaceRef, _base?: string, _baseBranch?: string): Promise<string | null> {
     throw new Error('SSH workspace IO not yet implemented');
   }
   getCommitHash(_ref: WorkspaceRef): Promise<string | null> {

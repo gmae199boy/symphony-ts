@@ -15,8 +15,10 @@ import path from 'node:path';
 import process from 'node:process';
 import { loadWorkflow, reloadConfig } from './config/loader.js';
 import { Orchestrator, type TransferableState } from './orchestrator.js';
+import { ensureDockerImage } from './workspace/docker.js';
 import { ConcurrencyLimiter } from './concurrency-limiter.js';
 import { logger } from './logger.js';
+import { spawnAsync } from './spawn-async.js';
 import type { AgentMessage } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -34,6 +36,23 @@ function parseArgs(argv: string[]): { workflowPath: string } {
   }
 
   return { workflowPath };
+}
+
+// ---------------------------------------------------------------------------
+// Git 업데이트 체크
+// ---------------------------------------------------------------------------
+
+async function checkForUpdates(): Promise<void> {
+  const fetch = await spawnAsync('git', ['fetch', '--quiet'], { timeoutMs: 10_000 });
+  if (fetch.status !== 0) return; // git 없음 또는 remote 없음 — 조용히 스킵
+
+  const behind = await spawnAsync('git', ['rev-list', 'HEAD..@{u}', '--count'], { timeoutMs: 5_000 });
+  if (behind.status !== 0) return; // upstream 미설정 — 스킵
+
+  const count = parseInt(behind.stdout.trim(), 10);
+  if (count > 0) {
+    logger.notice(`업데이트 ${count}개 있음 — 'git pull' 후 재시작하세요`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -60,13 +79,19 @@ async function main(): Promise<void> {
 
   const { config, promptTemplate } = loadWorkflow(absWorkflowPath);
 
+  await checkForUpdates();
+
   const agentKinds = config.agents.backends.map((a) => a.kind).join(', ');
   logger.info(
     `Symphony starting: ${config.trackers.length} tracker(s), agents=[${agentKinds}], workspace_backend=${config.workspace_backend}`,
   );
 
-  // 전역 동시성 제한기 — 모든 오케스트레이터가 공유
-  const limiter = new ConcurrencyLimiter(config.agents.max_concurrent);
+  if (config.workspace_backend === 'docker') {
+    await ensureDockerImage(config);
+  }
+
+  // 전역 컨테이너 admission 집합 — 모든 오케스트레이터가 공유
+  const limiter = new ConcurrencyLimiter(config.agents.max_containers);
 
   // 트래커당 오케스트레이터 하나씩 생성
   let orchestrators = config.trackers.map(
@@ -133,31 +158,98 @@ async function main(): Promise<void> {
       // 1. .env 재로드
       try { process.loadEnvFile(path.resolve(envPath)); } catch { /* absent is ok */ }
 
-      // 2. config 재로드
-      const { config: newConfig, promptTemplate: newTemplate } = reloadConfig(absWorkflowPath);
+      // 2. config 재로드 — 실패하면 drain 없이 기존 오케스트레이터 유지
+      let newConfig: typeof config;
+      let newTemplate: string;
+      try {
+        ({ config: newConfig, promptTemplate: newTemplate } = reloadConfig(absWorkflowPath));
+      } catch (err) {
+        logger.error('Config reload failed — keeping current config', { error: String(err) });
+        return;
+      }
 
-      // 3. 기존 orchestrator drain + 상태 추출
-      const states = await Promise.all(
+      // 3. 기존 orchestrator drain + 인덱스별 상태 추출
+      // Promise.allSettled: 일부 drain 실패 시에도 나머지 오케스트레이터는 정상 처리
+      const drainResults = await Promise.allSettled(
         orchestrators.map((o) => o.drainForSwap()),
       );
 
-      // 4. 상태 병합
-      const merged = mergeTransferableStates(states);
+      // 빈 상태 팩토리 (새 트래커가 추가된 경우 또는 drain 실패 시 fallback)
+      const emptyState = (): TransferableState => ({
+        issuePhases: new Map(),
+        pendingDispatch: new Set(),
+        watchedIssues: new Map(),
+        queuedComments: new Map(),
+        recentlyMerged: new Map(),
+        recentlyTerminated: new Map(),
+        missingTickCounts: new Map(),
+        completedCount: 0,
+        failedCount: 0,
+        admittedIdentifiers: [],
+      });
 
-      // 5. 새 limiter + orchestrator 생성
-      const newLimiter = new ConcurrencyLimiter(newConfig.agents.max_concurrent);
-      const newOrchestrators = newConfig.trackers.map((tc) => {
+      // drain 결과 처리: 실패한 오케스트레이터는 stop() 후 빈 상태로 대체
+      const states: TransferableState[] = drainResults.map((result, i) => {
+        if (result.status === 'fulfilled') return result.value;
+        logger.error(
+          `Orchestrator[${i}] drain failed — state lost for this tracker, using empty state`,
+          { error: String(result.reason) },
+        );
+        // drain 실패한 구 오케스트레이터 정리 (best-effort)
+        void orchestrators[i]?.stop().catch(() => undefined);
+        return emptyState();
+      });
+
+      const drainFailCount = drainResults.filter((r) => r.status === 'rejected').length;
+      if (drainFailCount > 0) {
+        logger.warn(`${drainFailCount}개 오케스트레이터 drain 실패 — 해당 트래커 상태가 초기화됩니다.`);
+      }
+
+      // 4. 전역 admitted 병합 (공유 limiter 시딩용)
+      const globalAdmitted = mergeTransferableStates(states).admittedIdentifiers;
+
+      // 5. 새 limiter + orchestrator 생성 (인덱스별 상태 라우팅, start 전)
+      const newLimiter = new ConcurrencyLimiter(newConfig.agents.max_containers);
+      const newOrchestrators = newConfig.trackers.map((tc, i) => {
         const o = new Orchestrator(newConfig, tc, newTemplate, newLimiter);
-        o.injectState(merged);
+        // 동일 인덱스 old orchestrator의 상태를 주입; admittedIdentifiers는 전역 병합 사용
+        const perState = states[i] ?? emptyState();
+        o.injectState({ ...perState, admittedIdentifiers: globalAdmitted });
         return o;
       });
 
-      // 6. 기존 orchestrator 리스너 정리 후 재등록 + 시작
-      orchestrators.forEach((o) => o.removeAllListeners());
-      newOrchestrators.forEach((o) => {
-        registerOrchestratorEvents(o);
-        o.start();
-      });
+      // 6. start() 시도 — HumanChannel 초기화 실패 등의 경우 rollback
+      try {
+        orchestrators.forEach((o) => o.removeAllListeners());
+        newOrchestrators.forEach((o) => {
+          registerOrchestratorEvents(o);
+          o.start();
+        });
+      } catch (startErr) {
+        logger.error('New orchestrator start failed — rolling back to old config', { error: String(startErr) });
+        for (const o of newOrchestrators) {
+          try { await o.stop(); } catch { /* best-effort */ }
+        }
+        // 기존 오케스트레이터는 drain으로 이미 stopped → 기존 config로 재생성
+        const rollbackLimiter = new ConcurrencyLimiter(config.agents.max_containers);
+        const rollbackOrchestrators = config.trackers.map((tc, i) => {
+          const o = new Orchestrator(config, tc, promptTemplate, rollbackLimiter);
+          const perState = states[i] ?? emptyState();
+          o.injectState({ ...perState, admittedIdentifiers: globalAdmitted });
+          return o;
+        });
+        try {
+          rollbackOrchestrators.forEach((o) => {
+            registerOrchestratorEvents(o);
+            o.start();
+          });
+        } catch (rollbackErr) {
+          logger.error('CRITICAL: rollback orchestrator start also failed — exiting', { error: String(rollbackErr) });
+          process.exit(1);
+        }
+        orchestrators = rollbackOrchestrators;
+        return;
+      }
 
       orchestrators = newOrchestrators;
       logger.info('Config reloaded successfully');
@@ -188,19 +280,29 @@ function mergeTransferableStates(states: TransferableState[]): TransferableState
     watchedIssues: new Map(),
     queuedComments: new Map(),
     recentlyMerged: new Map(),
+    recentlyTerminated: new Map(),
+    missingTickCounts: new Map(),
+    canceledPendingMap: new Map(),
     completedCount: 0,
     failedCount: 0,
+    admittedIdentifiers: [],
   };
 
+  const admittedSet = new Set<string>();
   for (const s of states) {
     for (const [k, v] of s.issuePhases) merged.issuePhases.set(k, v);
     for (const v of s.pendingDispatch) merged.pendingDispatch.add(v);
     for (const [k, v] of s.watchedIssues) merged.watchedIssues.set(k, v);
     for (const [k, v] of s.queuedComments) merged.queuedComments.set(k, v);
     for (const [k, v] of s.recentlyMerged) merged.recentlyMerged.set(k, v);
+    for (const [k, v] of (s.recentlyTerminated ?? [])) merged.recentlyTerminated.set(k, v);
+    for (const [k, v] of (s.missingTickCounts ?? [])) merged.missingTickCounts.set(k, v);
+    for (const [k, v] of (s.canceledPendingMap ?? [])) merged.canceledPendingMap!.set(k, v);
     merged.completedCount += s.completedCount;
     merged.failedCount += s.failedCount;
+    for (const id of s.admittedIdentifiers ?? []) admittedSet.add(id);
   }
+  merged.admittedIdentifiers = [...admittedSet];
 
   return merged;
 }

@@ -72,7 +72,7 @@ graph TB
 | **Tracker Poller** | Jira/Linear에서 활성 상태 이슈를 주기적으로 조회하여 새 이슈를 감지 |
 | **Repo Poller** | GitHub/Bitbucket에서 열린 PR을 주기적으로 조회하여 새 댓글(`new_comments`) 및 머지(`pr_merged`) 이벤트를 감지 |
 | **Slack Poller** | 감시 중인 Slack 스레드에서 사용자 답글과 ✅ 리액션을 감지 |
-| **ReviewOrchestrator** | 멀티 에이전트 × N 라운드 셀프 리뷰 실행 후 validator가 결과를 취합 |
+| **ReviewOrchestrator** | 멀티 에이전트 × N 라운드 셀프 리뷰 실행 후, semgrep 정적 분석 결과와 함께 validator가 전체 결과를 취합 |
 | **Docker Container** | 이슈당 1개. 에이전트가 코드를 작성하는 격리된 작업 공간. 오케스트레이터는 `docker exec`로 컨테이너 내부 파일을 읽고/쓰며, 에이전트도 `docker exec`로 컨테이너 안에서 실행 |
 
 ---
@@ -120,11 +120,13 @@ src/
 │   ├── orchestrator.ts      # 셀프 리뷰 오케스트레이터
 │   ├── claude-review.ts     # Claude 리뷰 백엔드
 │   ├── codex-review.ts      # Codex 리뷰 백엔드
+│   ├── semgrep-runner.ts    # semgrep 정적 분석 실행/파싱/포맷
+│   ├── semgrep-runner.test.ts # semgrep-runner 단위 테스트
 │   ├── prompt.ts            # 리뷰 프롬프트 생성
 │   └── types.ts             # 리뷰 타입
 │
 └── slack/
-    ├── poller.ts            # Slack 스레드 폴링
+    ├── socket.ts            # Slack Socket Mode 이벤트 수신 (WebSocket)
     └── notifier.ts          # Slack 메시지 전송
 ```
 
@@ -219,10 +221,14 @@ sequenceDiagram
     Note over OC: 4단계: 셀프 리뷰
 
     OC->>R: 셀프 리뷰 실행
-    loop 에이전트별 × 라운드별
-        R->>D: 리뷰 실행 (새 세션, 이전 라운드 결과 제외)
+    par 병렬 실행
+        loop 에이전트별 × 라운드별
+            R->>D: 리뷰 실행 (새 세션, 이전 라운드 결과 제외)
+        end
+    and
+        R->>D: semgrep 정적 분석 실행 (설정된 경우)
     end
-    R->>D: validator가 전체 결과 취합
+    R->>D: validator가 에이전트 리뷰 + semgrep 결과 통합 취합
     R-->>OC: pending_review.md 반환
     OC->>D: pending_review.md 저장
     OC->>S: "🔍 셀프 리뷰 결과"
@@ -391,6 +397,7 @@ flowchart TD
 | `pending_plan.md` | Agent → OC | 에이전트가 작성한 계획. OC가 읽고 Slack 전송 후 비움 |
 | `pending_review.md` | OC → Agent | ReviewOrchestrator가 생성한 리뷰 결과. 에이전트가 피드백 시 수정 가능 |
 | `question.md` | Agent → OC | 에이전트가 작성한 질문. OC가 읽고 Slack 전송 후 비움 |
+| `pending_reply.md` | OC → Agent | 에이전트 질문에 대한 사용자 답변. OC가 작성하고 Slack 전달 후 초기화 |
 | `pr_feedback.json` | OC → Agent | PR 댓글 목록. 에이전트가 읽고 수정 계획 수립 |
 | `pr_created.json` | Agent → OC | 에이전트가 PR 생성 후 작성. OC가 읽고 Slack 알림 전송 |
 | `review_sent` | OC 내부 | 리뷰 전송 여부 마커. 리뷰 응답과 계획 응답을 구분하는 데 사용 |
@@ -402,10 +409,9 @@ flowchart TD
 
 ## 8. 설정 레퍼런스
 
-WORKFLOW.md 파일의 YAML front-matter로 설정한다:
+`symphony.yaml` 파일로 설정한다 (`symphony.example.yaml` 복사 후 수정):
 
 ```yaml
----
 # ── 워크스페이스 백엔드 ────────────────────────────────────────────────────
 # 'docker': 이슈별 Docker 컨테이너 생성 (격리, 권장)
 # 'local':  호스트 디렉토리에 이슈별 폴더 생성 (간단하지만 격리 없음)
@@ -477,11 +483,16 @@ trackers:
   #     poll_interval_ms: 30000
   #     pr_label_filter: symphony  # 이 라벨이 붙은 PR만 처리
   #     event_source: polling
+  #     branch_strategy:           # 생략 시 production=main, development=main
+  #       production: main         # 핫픽스 이슈 기준 브랜치 및 PR 대상
+  #       development: develop     # 일반 이슈 기준 브랜치 및 PR 대상
+  #       hotfix_labels: [hotfix]  # 이 레이블 이슈는 production 기준으로 처리
+  #       protect_production: true # 비-핫픽스 이슈의 production 사용을 경고
 
 # ── 에이전트 ──────────────────────────────────────────────────────────────
 # backends: 이슈당 순서대로 실행. trigger 조건으로 특정 이슈에만 특정 에이전트 적용 가능.
 agents:
-  max_concurrent: 10             # 전체 동시 실행 에이전트 최대 수
+  max_containers: 10             # 동시에 존재할 수 있는 최대 컨테이너(=활성 이슈) 수
   retry_backoff_ms: 5000         # 재시도 기본 백오프 (ms). 지수 증가: 5s, 10s, 20s...
   max_retries: 2                 # 에이전트 실패 시 자동 재시도 횟수 (기본 2회)
 
@@ -551,11 +562,6 @@ slack:
 # server:
 #   port: 4000                   # HTTP 서버 포트 (헬스체크, webhook 수신 등)
 #   host: 0.0.0.0                # 바인딩 주소
----
-
-# 여기부터 Liquid 템플릿 (에이전트 프롬프트)
-You are working on {{ issue.identifier }}: {{ issue.title }}
-...
 ```
 
 ### 환경변수

@@ -1,0 +1,220 @@
+# ============================================================
+# Symphony TS — Full Configuration Example
+# Copy this file to symphony.yaml and fill in your values.
+# symphony.yaml is gitignored — this file is safe to commit.
+# ============================================================
+
+# ── Workspace backend ────────────────────────────────────────
+# "local" (default): creates a per-issue directory under workspace.root
+# "docker": creates a per-issue Docker container
+workspace_backend: docker
+
+# ── Trackers ─────────────────────────────────────────────────
+# Multiple trackers can run simultaneously (trackers: array).
+# A single tracker can also be set with tracker: (singular form).
+trackers:
+  # ── Linear tracker ───────────────────────────────────────
+  - kind: linear
+    project_slug: "your-project-slug"
+    api_key: $LINEAR_API_KEY
+    assignee: me                # "me" = current Linear user, or a Linear user ID
+    poll_interval_ms: 15000
+    # endpoint: https://api.linear.app/graphql   # override only if using a self-hosted proxy
+    states:
+      planning: Todo
+      plan_review: Plan Review
+      in_progress: In Progress
+      in_review: In Review
+      done: Done
+      canceled: Canceled
+    # active_states and terminal_states are derived from `states` automatically.
+    # Override here only if your board uses non-standard state names:
+    # active_states: [Todo, Plan Review, In Progress]
+    # terminal_states: [Done, Canceled]
+
+    repository:
+      kind: github
+      repo: your-org/your-repo
+      token: $GITHUB_TOKEN
+      poll_interval_ms: 20000
+      pr_label_filter: symphony   # only track PRs with this label
+      event_source: polling       # polling | webhook
+      # webhook_secret: $GITHUB_WEBHOOK_SECRET
+      issue_labels: []            # route issues with these labels to this repo (multi-repo setups)
+      hooks:
+        after_create: |           # runs after container/directory creation, before clone
+          echo "workspace ready"
+        after_clone: |            # runs after git clone
+          npm ci --prefer-offline
+        before_run: |             # runs before each agent turn
+          # branch_strategy.development 브랜치명에 맞게 수정하세요 (기본값: main)
+          git fetch origin && git merge origin/main --no-edit
+        after_run: |              # runs after each agent turn
+          rm -rf node_modules/.cache
+        before_remove: |          # runs before workspace teardown
+          echo "workspace $(pwd) removed at $(date)" >> /var/log/symphony.log
+        timeout_ms: 600000        # hook execution timeout (ms), default 300000
+
+  # ── Jira tracker (multi-repo example: frontend / backend) ─
+  - kind: jira
+    project_key: "YOUR_PROJECT_KEY"
+    host: https://your-org.atlassian.net/
+    email: $JIRA_EMAIL
+    api_token: $JIRA_API_TOKEN
+    poll_interval_ms: 60000       # Jira Cloud has strict rate limits — 60s recommended
+    states:
+      planning: To Do
+      plan_review: Plan Review
+      in_progress: In Progress
+      in_review: In Review
+      done: Done
+      canceled: Canceled
+    repositories:
+      - kind: bitbucket
+        workspace: your-workspace
+        repo_slug: your-frontend-repo
+        email: $BITBUCKET_EMAIL           # Atlassian account email for REST API Basic auth
+        username: $BITBUCKET_USERNAME     # Bitbucket username (nickname) for git clone
+        api_token: $BITBUCKET_API_TOKEN
+        poll_interval_ms: 30000
+        event_source: polling
+        # webhook_secret: $BITBUCKET_WEBHOOK_SECRET
+        # pr_label_filter: symphony
+        issue_labels: [frontend]          # issues labelled "frontend" route here
+        branch_strategy:
+          production: main                # 운영 브랜치: 핫픽스 이슈의 체크아웃 기준 및 PR 대상 (일반 이슈는 development 사용)
+          development: develop            # 개발 브랜치: 일반 이슈의 기준 브랜치 및 PR 대상
+          hotfix_labels: [hotfix]         # 이 레이블이 있는 이슈는 production 브랜치 기준으로 처리
+          protect_production: true        # 비-핫픽스 이슈의 production 브랜치 사용을 경고
+        hooks:
+          after_clone: |
+            npm ci --prefer-offline
+
+      - kind: bitbucket
+        workspace: your-workspace
+        repo_slug: your-backend-repo
+        email: $BITBUCKET_EMAIL
+        username: $BITBUCKET_USERNAME
+        api_token: $BITBUCKET_API_TOKEN
+        poll_interval_ms: 30000
+        event_source: polling
+        issue_labels: [backend]           # issues labelled "backend" route here
+        # branch_strategy는 생략 가능 — 기본값: production=main, development=main, hotfix_labels=[hotfix], protect_production=true
+        hooks:
+          after_clone: |
+            npm ci --prefer-offline
+
+# ── Agents ───────────────────────────────────────────────────
+agents:
+  max_containers: 5             # max simultaneous containers (= active issues)
+  retry_backoff_ms: 10000       # delay between retries (ms)
+  max_retries: 2                # max retry attempts per issue
+
+  # ── Self-review ────────────────────────────────────────────
+  review:
+    rounds: 2                   # number of review rounds per agent
+    kinds:                      # review agents to run in parallel (must match backends[].kind)
+      - claude
+      # - codex
+
+    # ── semgrep static analysis (optional) ───────────────────
+    # semgrep runs in parallel with agent review rounds and results are
+    # integrated into the consolidation step by the main agent.
+    # Requires semgrep to be installed in the worker environment.
+    # semgrep:
+    #   command: semgrep          # path or name of the semgrep binary
+    #   config:                   # semgrep rule sets to use
+    #     - p/default
+    #     - p/security-audit
+    #   paths: ["."]              # paths to scan (relative to workspace root)
+    #   timeout_ms: 300000        # semgrep execution timeout (ms)
+    #   severity_map:             # semgrep severity → review severity mapping
+    #     ERROR: BLOCKER
+    #     WARNING: SUGGESTION
+    #     INFO: NIT
+    #   app_token: $SEMGREP_APP_TOKEN   # optional: semgrep.dev app token
+    #                                   # generate at https://semgrep.dev/orgs/-/settings/tokens
+    #                                   # 주의: YAML에 토큰 리터럴을 직접 기재하지 말 것.
+    #                                   # CI 등 공유 환경에서는 secret store 경유 주입 권장.
+    #                                   # auto 모드 + 프리미엄 룰셋 사용 예시:
+    #                                   #   config: [auto]
+    #                                   #   app_token: $SEMGREP_APP_TOKEN
+
+  # ── Backends ───────────────────────────────────────────────
+  backends:
+    # ── Claude — primary implementation agent ────────────────
+    - kind: claude
+      primary: true             # main agent for planning/implementation/review consolidation
+      command: claude           # path or name of the claude binary
+      models:
+        planning: opus           # model used during planning phase
+        implementation: sonnet   # model used during implementation phase
+      max_turns: 30             # max agent turns per dispatch (omit for unlimited)
+      max_budget_usd: 10.0      # optional per-turn spend cap (USD)
+      mcp_config: ./mcp.json    # path to MCP server config JSON
+      allowed_tools: []         # restrict Claude tools (empty = all tools allowed)
+        # - Bash
+        # - Read
+        # - Edit
+        # - Write
+      turn_timeout_ms: 3600000  # wall-clock timeout per turn (ms), default 1h
+      claude_auth_dir: /home/ci/.claude   # host dir with Claude auth/session files (overrides default credential injection)
+      # trigger: (omit = always runs)
+      # trigger:
+      #   issue_labels: [backend]
+      #   pr_labels: [symphony]
+      #   assignees: [dev@example.com]
+
+    # ── Codex — secondary agent for specific labels ───────────
+    - kind: codex
+      primary: false            # set true only if codex should be the main planning/review agent
+      command: >
+        codex
+        --config shell_environment_policy.inherit=all
+        --config model_reasoning_effort=xhigh
+        --model gpt-5.3-codex
+        app-server
+      max_turns: 10
+      approval_policy: never
+      thread_sandbox: workspace-write
+      turn_sandbox_policy:
+        type: workspaceWrite
+      trigger:
+        issue_labels:
+          - security
+          - compliance
+
+# ── Workspace ────────────────────────────────────────────────
+workspace:
+  root: ./symphony-workspaces     # directory where per-issue workspaces are created
+
+# ── Worker (SSH remote execution) ────────────────────────────
+# worker:
+#   ssh_hosts: []                 # list of SSH hosts for distributed execution
+
+# ── Docker backend (used when workspace_backend: docker) ─────
+docker:
+  image: your-org/symphony-worker:latest
+  auth_mount: /home/ci/.claude    # host directory mounted read-only into the container
+  memory: 8g
+  cpus: "4"
+  env:                            # extra environment variables injected into the container
+    NPM_TOKEN: $NPM_TOKEN
+    # SENTRY_DSN: $SENTRY_DSN
+
+# ── Slack (plan approval workflow) ───────────────────────────
+# Uses Socket Mode — no public IP required. Enable Socket Mode in your Slack app settings.
+slack:
+  bot_token: $SLACK_BOT_TOKEN
+  app_token: $SLACK_APP_TOKEN     # App-Level Token (xapp-...) — required for Socket Mode
+  channel: $SLACK_CHANNEL_ID
+  inter_file_delay_ms: 1000       # delay between snippet uploads (ms); increase if rate-limited
+
+# ── Observability ─────────────────────────────────────────────
+# observability:
+#   refresh_interval_ms: 2000     # dashboard refresh interval (ms)
+
+# ── Server ───────────────────────────────────────────────────
+server:
+  port: 4000
+  host: 127.0.0.1

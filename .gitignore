@@ -29,3 +29,9 @@ logs/
 
 # Remote sync config (contains SSH key path and server IP)
 .sync.env
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Symphony per-user/org configuration (use symphony.example.yaml as template)
+symphony.yaml

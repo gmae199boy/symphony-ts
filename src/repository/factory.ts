@@ -11,7 +11,7 @@ import type { RepositoryConfig } from '../config/schema.js';
 export interface RepoClientApi {
   fetchOpenPRs(): Promise<PullRequest[]>;
   fetchPR(prNumber: number): Promise<PullRequest | null>;
-  deleteBranch(branchName: string): Promise<void>;
+  deleteBranch(branchName: string): Promise<boolean>;
   fetchPRReviews(prNumber: number): Promise<Review[]>;
   fetchPRComments(prNumber: number): Promise<Comment[]>;
 }

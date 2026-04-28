@@ -30,8 +30,12 @@ export class LocalWorkspaceIO implements WorkspaceIO {
     await fs.promises.writeFile(fullPath, content, 'utf8');
   }
 
-  async getDiff(ref: WorkspaceRef, base?: string): Promise<string | null> {
-    const range = base ? `${base}..HEAD` : 'origin/main...HEAD';
+  async getDiff(ref: WorkspaceRef, base?: string, baseBranch?: string): Promise<string | null> {
+    // base가 없는 fallback 경로는 base_commit이 없는 경우에만 사용됨.
+    // baseBranch가 설정된 경우 해당 브랜치 기준으로 diff를 계산하고,
+    // 없으면 origin/main으로 폴백 (하위 호환성 유지).
+    const fallback = baseBranch ? `origin/${baseBranch}...HEAD` : 'origin/main...HEAD';
+    const range = base ? `${base}..HEAD` : fallback;
     const proc = await spawnAsync('git', ['diff', range], {
       cwd: ref.workspace,
       timeoutMs: 30_000,

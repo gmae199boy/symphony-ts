@@ -27,7 +27,7 @@ export class LocalWorkspaceBackend implements WorkspaceBackend {
   private get hooks() { return this.repository?.hooks; }
   private get hookTimeoutMs() { return this.hooks?.timeout_ms ?? 300_000; }
 
-  async create(issue: Issue, _workerHost?: string): Promise<WorkspaceRef> {
+  async create(issue: Issue, _workerHost?: string, baseBranch?: string): Promise<WorkspaceRef> {
     const root = path.resolve(this.config.workspace.root);
     fs.mkdirSync(root, { recursive: true });
 
@@ -47,8 +47,8 @@ export class LocalWorkspaceBackend implements WorkspaceBackend {
       // Auto-clone
       if (this.repository) {
         const cloneUrl = buildCloneUrl(this.repository);
-        logger.info(`Cloning ${cloneUrl} into ${workspacePath}`);
-        const cloneCmd = buildLocalCloneCommand(cloneUrl, this.repository);
+        logger.info(`Cloning ${cloneUrl} into ${workspacePath}${baseBranch ? ` (branch: ${baseBranch})` : ''}`);
+        const cloneCmd = buildLocalCloneCommand(cloneUrl, this.repository, baseBranch);
         const cloneResult = await spawnAsync('bash', ['-lc', cloneCmd], {
           cwd: workspacePath, timeoutMs: this.hookTimeoutMs,
         });
@@ -116,7 +116,8 @@ export function issueDir(issue: Pick<Issue, 'identifier'>): string {
  * Builds a git clone command that passes credentials via an inline credential helper,
  * without embedding them in the URL or modifying the global ~/.git-credentials.
  */
-function buildLocalCloneCommand(cloneUrl: string, repository: RepositoryConfig): string {
+function buildLocalCloneCommand(cloneUrl: string, repository: RepositoryConfig, baseBranch?: string): string {
+  const branchFlag = baseBranch ? `--branch ${shellEscape(baseBranch)} ` : '';
   if (repository.kind === 'bitbucket') {
     const token = repository.api_token ?? process.env['BITBUCKET_API_TOKEN'];
     if (token) {
@@ -125,8 +126,8 @@ function buildLocalCloneCommand(cloneUrl: string, repository: RepositoryConfig):
       const pass = encodeURIComponent(token);
       // Inline credential helper — one-shot, does not modify global git config.
       const helper = `!f() { echo username=${user}; echo password=${pass}; }; f`;
-      return `git -c ${shellEscape(`credential.helper=${helper}`)} clone --depth 1 ${shellEscape(cloneUrl)} .`;
+      return `git -c ${shellEscape(`credential.helper=${helper}`)} clone --depth 1 ${branchFlag}${shellEscape(cloneUrl)} .`;
     }
   }
-  return `git clone --depth 1 ${shellEscape(cloneUrl)} .`;
+  return `git clone --depth 1 ${branchFlag}${shellEscape(cloneUrl)} .`;
 }

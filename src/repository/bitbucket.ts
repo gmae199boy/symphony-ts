@@ -131,7 +131,7 @@ export class BitbucketClient {
     }
   }
 
-  async deleteBranch(branchName: string): Promise<void> {
+  async deleteBranch(branchName: string): Promise<boolean> {
     const url = `${BITBUCKET_API}/2.0/repositories/${this.config.workspace}/${this.config.repo_slug}/refs/branches/${encodeURIComponent(branchName)}`;
 
     const headers: Record<string, string> = {};
@@ -153,10 +153,13 @@ export class BitbucketClient {
       signal: AbortSignal.timeout(30_000),
     });
 
-    if (!response.ok && response.status !== 404) {
+    if (response.status === 404) return false;
+    if (!response.ok) {
       const body = await response.text().catch(() => '');
       logger.warn(`Bitbucket deleteBranch failed: ${response.status} ${body.slice(0, 300)}`);
+      return false;
     }
+    return true;
   }
 
   async fetchPRComments(prNumber: number): Promise<Comment[]> {
@@ -171,8 +174,9 @@ export class BitbucketClient {
       url = page.next ?? null;
     }
 
+    const botUsername = this.config.username ?? process.env['BITBUCKET_USERNAME'] ?? null;
     return allComments
-      .map(parseBitbucketComment)
+      .map((c) => parseBitbucketComment(c, botUsername))
       .sort((a, b) => {
         const ta = a.createdAt?.getTime() ?? 0;
         const tb = b.createdAt?.getTime() ?? 0;
@@ -277,13 +281,15 @@ function hashString(str: string): number {
   return Math.abs(hash);
 }
 
-function parseBitbucketComment(data: BitbucketComment): Comment {
+function parseBitbucketComment(data: BitbucketComment, botUsername: string | null): Comment {
   const login = data.user.nickname ?? data.user.display_name ?? '';
+  const isSelf = botUsername !== null && login === botUsername;
+  const body = data.content.raw ?? '';
   return {
     id: `bb:${data.id}`,
-    body: data.content.raw ?? '',
+    body,
     authorLogin: login,
-    isBot: isBotLogin(login) || (data.user.type != null && data.user.type !== 'user'),
+    isBot: isSelf || body.includes('<!-- ai-runner -->') || isBotLogin(login) || (data.user.type != null && data.user.type !== 'user'),
     createdAt: parseDate(data.created_on ?? null),
     path: data.inline?.path ?? null,
     line: data.inline?.to ?? null,

@@ -1,21 +1,23 @@
 /**
  * SlackChannel — HumanChannel implementation using Slack.
  *
- * Receives events via Socket Mode (WebSocket).
+ * Receives events via Socket Mode (@slack/bolt SocketModeReceiver).
  * Thread state is managed by SlackThreadManager.
  */
 
+import type { WebClient } from '@slack/web-api';
 import { logger } from '../logger.js';
-import { SlackSocketReceiver, type SlackResponseEvent } from '../slack/socket.js';
+import { SlackBoltReceiver, type SlackResponseEvent } from '../slack/bolt-app.js';
 import { SlackThreadManager } from '../slack/thread-store.js';
 import { sendSlackMessage, sendSlackMessageChunked } from '../slack/notifier.js';
 import type { Issue } from '../types.js';
 import type { SlackConfig } from '../config/schema.js';
 import type { HumanChannel, ApprovalType, HumanResponseHandler } from './types.js';
+import { formatIssueLabel } from '../utils.js';
 
 
 export class SlackChannel implements HumanChannel {
-  private readonly receiver: SlackSocketReceiver;
+  private readonly receiver: SlackBoltReceiver;
   private readonly threadManager: SlackThreadManager;
   private readonly config: NonNullable<SlackConfig>;
   private readonly onResponse: HumanResponseHandler;
@@ -31,7 +33,7 @@ export class SlackChannel implements HumanChannel {
 
     const handleEvent = (event: SlackResponseEvent) => this.handleSlackEvent(event);
 
-    this.receiver = new SlackSocketReceiver(
+    this.receiver = new SlackBoltReceiver(
       { appToken: config.app_token, botToken: config.bot_token },
       this.threadManager,
       handleEvent,
@@ -43,8 +45,12 @@ export class SlackChannel implements HumanChannel {
     await this.receiver.start();
   }
 
-  stop(): void {
-    this.receiver.stop();
+  async stop(): Promise<void> {
+    await this.receiver.stop();
+  }
+
+  getWebClient(): WebClient {
+    return this.receiver.client;
   }
 
   async sendForApproval(
@@ -53,6 +59,7 @@ export class SlackChannel implements HumanChannel {
     type: ApprovalType,
     workspaceName: string,
   ): Promise<boolean> {
+    const client = this.receiver.client;
     const existingThread = this.threadManager.getThread(issue.identifier);
     let threadRegistered = !!existingThread;
 
@@ -64,9 +71,9 @@ export class SlackChannel implements HumanChannel {
       let threadForReview = existingThread;
       if (!threadForReview) {
         const header = await sendSlackMessage(
-          this.config.bot_token,
+          client,
           this.config.channel,
-          `🔍 *[${issue.identifier}]* 셀프리뷰 결과`,
+          `🔍 *[${formatIssueLabel(issue)}]* 셀프리뷰 결과`,
         );
         if (!header) return false;
         this.threadManager.watch(issue.identifier, issue.id, workspaceName, {
@@ -78,7 +85,7 @@ export class SlackChannel implements HumanChannel {
         threadForReview = this.threadManager.getThread(issue.identifier);
       }
       result = await sendSlackMessageChunked(
-        this.config.bot_token,
+        client,
         threadForReview?.threadInfo.channel ?? this.config.channel,
         content,
         threadForReview?.threadInfo.thread_ts,
@@ -94,9 +101,9 @@ export class SlackChannel implements HumanChannel {
       const footer = planCount > 1
         ? `\n\n번호로 계획 선택 (예: "1" 또는 "plan 2"), 피드백: 자유롭게 작성`
         : `\n\n✅ 리액션 = 승인, 피드백: 자유롭게 작성`;
-      text = `📋 *[${issue.identifier}] 계획 #${planNumber}*\n\n${content}${footer}`;
+      text = `📋 *[${formatIssueLabel(issue)}]* 계획 #${planNumber}\n\n${content}${footer}`;
       result = await sendSlackMessageChunked(
-        this.config.bot_token,
+        client,
         existingThread?.threadInfo.channel ?? this.config.channel,
         text,
         existingThread?.threadInfo.thread_ts,
@@ -104,9 +111,9 @@ export class SlackChannel implements HumanChannel {
       );
     } else {
       // question
-      text = `❓ *[${issue.identifier}]* 질문\n\n${content}`;
+      text = `❓ *[${formatIssueLabel(issue)}]* 질문\n\n${content}`;
       result = await sendSlackMessageChunked(
-        this.config.bot_token,
+        client,
         existingThread?.threadInfo.channel ?? this.config.channel,
         text,
         existingThread?.threadInfo.thread_ts,
@@ -132,18 +139,17 @@ export class SlackChannel implements HumanChannel {
 
     if (type === 'plan' || type === 'review') {
       this.threadManager.setApprovalMessageTs(issue.identifier, result.ts);
-      if (type === 'plan') {
-        this.threadManager.setPendingPlanCount(issue.identifier, planCount);
-      }
+      this.threadManager.setPendingPlanCount(issue.identifier, type === 'plan' ? planCount : 1);
     }
 
     return true;
   }
 
   async sendNotification(issue: Issue, message: string, workspaceName?: string): Promise<void> {
+    const client = this.receiver.client;
     const thread = this.threadManager.getThread(issue.identifier);
     const result = await sendSlackMessage(
-      this.config.bot_token,
+      client,
       thread?.threadInfo.channel ?? this.config.channel,
       message,
       thread?.threadInfo.thread_ts,

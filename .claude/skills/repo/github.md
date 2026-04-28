@@ -15,7 +15,10 @@ gh pr merge <PR_NUMBER> --squash --auto --delete-branch
 gh pr list --state open --label symphony
 
 # Create PR
-gh pr create --title "Title" --body "Description" --label symphony
+# IMPORTANT: set BASE_BRANCH before running the command.
+# Use the injected base_branch template variable (hotfix → production branch, regular → development branch).
+BASE_BRANCH="{{ base_branch }}"
+gh pr create --title "Title" --body "Description" --label symphony --base "$BASE_BRANCH"
 
 # Add label
 gh pr edit <PR_NUMBER> --add-label symphony

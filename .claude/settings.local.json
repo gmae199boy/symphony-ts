@@ -25,7 +25,10 @@
       "mcp__sequential-thinking__sequentialthinking",
       "WebFetch(domain:support.atlassian.com)",
       "WebFetch(domain:status.anthropic.com)",
-      "WebFetch(domain:status.claude.com)"
+      "WebFetch(domain:status.claude.com)",
+      "Bash(git *)",
+      "Bash(pnpm test *)",
+      "WebFetch(domain:docs.anthropic.com)"
     ]
   }
 }

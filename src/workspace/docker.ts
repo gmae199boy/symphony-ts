@@ -9,10 +9,11 @@
  *  - hooks (before_run/after_run): `docker exec`를 통해 컨테이너 내부에서 실행됩니다.
  */
 
+import crypto from 'node:crypto';
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 
 import { logger } from '../logger.js';
 import { issueCtx } from '../utils.js';
@@ -32,6 +33,7 @@ const ENV_PASS_THROUGH = [
   'JIRA_EMAIL',
   'BITBUCKET_API_TOKEN',
   'BITBUCKET_WORKSPACE',
+  'BITBUCKET_USERNAME',
   'SLACK_BOT_TOKEN',
   'SLACK_CHANNEL_ID',
 ];
@@ -50,7 +52,7 @@ export class DockerWorkspaceBackend implements WorkspaceBackend {
   private get hooks() { return this.repository?.hooks; }
   private get hookTimeoutMs() { return this.hooks?.timeout_ms ?? 300_000; }
 
-  async create(issue: Issue, _workerHost?: string): Promise<WorkspaceRef> {
+  async create(issue: Issue, _workerHost?: string, baseBranch?: string): Promise<WorkspaceRef> {
     const name = containerName(issue);
 
     if (await containerExists(name)) {
@@ -60,7 +62,7 @@ export class DockerWorkspaceBackend implements WorkspaceBackend {
       return { workspace: WORKSPACE_PATH, containerName: name };
     }
 
-    return this.startContainer(name, issue);
+    return this.startContainer(name, issue, baseBranch);
   }
 
   async runBeforeRunHook(ref: WorkspaceRef, issue: Issue): Promise<void> {
@@ -108,7 +110,7 @@ export class DockerWorkspaceBackend implements WorkspaceBackend {
   // 컨테이너 시작
   // ---------------------------------------------------------------------------
 
-  private async startContainer(name: string, issue: Issue): Promise<WorkspaceRef> {
+  private async startContainer(name: string, issue: Issue, baseBranch?: string): Promise<WorkspaceRef> {
     const cfg = this.config.docker;
 
     logger.info(`Starting container for ${issueCtx(issue)}`, { container: name, image: cfg.image });
@@ -153,6 +155,7 @@ export class DockerWorkspaceBackend implements WorkspaceBackend {
     if (this.repository?.kind === 'bitbucket') {
       if (this.repository.api_token) dockerArgs.push('-e', `BITBUCKET_API_TOKEN=${this.repository.api_token}`);
       if (this.repository.email) dockerArgs.push('-e', `BITBUCKET_EMAIL=${this.repository.email}`);
+      if (this.repository.username) dockerArgs.push('-e', `BITBUCKET_USERNAME=${this.repository.username}`);
     } else if (this.repository?.kind === 'github') {
       if (this.repository.token) dockerArgs.push('-e', `GITHUB_TOKEN=${this.repository.token}`);
     }
@@ -194,8 +197,9 @@ export class DockerWorkspaceBackend implements WorkspaceBackend {
     // 자동 클론
     if (this.repository) {
       const cloneUrl = buildCloneUrl(this.repository);
-      logger.info(`Cloning ${cloneUrl} into container ${name}`);
-      const cloneCmd = `if [ -d .git ]; then echo 'already cloned'; else find . -mindepth 1 -delete 2>/dev/null || true; git clone --depth 1 ${shellEscape(cloneUrl)} .; fi`;
+      logger.info(`Cloning ${cloneUrl} into container ${name}${baseBranch ? ` (branch: ${baseBranch})` : ''}`);
+      const branchFlag = baseBranch ? `--branch ${shellEscape(baseBranch)} ` : '';
+      const cloneCmd = `if [ -d .git ]; then echo 'already cloned'; else find . -mindepth 1 -delete 2>/dev/null || true; git clone --depth 1 ${branchFlag}${shellEscape(cloneUrl)} .; fi`;
       await dockerExec(name, cloneCmd, this.hookTimeoutMs);
 
       // .claude/skills를 워크스페이스에 심볼릭 링크 (마운트 경로: /home/worker/.claude/skills)
@@ -284,7 +288,11 @@ export async function killClaudeProcesses(name: string): Promise<void> {
   );
 }
 
-/** 컨테이너 이름에서 이슈 식별자를 추출합니다 (containerNameForIssue의 역연산). */
+/**
+ * 컨테이너 이름에서 이슈 식별자를 추출합니다 (containerNameForIssue의 역연산).
+ * 표준 식별자([A-Z]+-[0-9]+)는 특수 문자가 없으므로 역연산이 성립한다.
+ * 특수 문자가 '_'로 치환된 식별자는 원본 복원이 불가능하다.
+ */
 export function identifierFromContainerName(name: string): string | null {
   if (!name.startsWith(CONTAINER_PREFIX)) return null;
   return name.slice(CONTAINER_PREFIX.length);
@@ -429,6 +437,55 @@ export async function injectClaudeCredentialsFromDir(
   } else {
     logger.info('Injected Claude credentials from auth dir', { container, authDir });
   }
+}
+
+export async function ensureDockerImage(config: Config): Promise<void> {
+  const dockerfilePath = path.resolve('docker/Dockerfile');
+  if (!fs.existsSync(dockerfilePath)) {
+    logger.debug('docker/Dockerfile not found — skipping auto-build (external registry image assumed)');
+    return;
+  }
+
+  const imageTag = config.docker.image;
+  const currentHash = crypto.createHash('sha256').update(fs.readFileSync(dockerfilePath)).digest('hex');
+
+  const inspectResult = await spawnAsync(
+    'docker',
+    ['image', 'inspect', '--format', '{{index .Config.Labels "symphony.dockerfile-hash"}}', imageTag],
+    { timeoutMs: 10_000 },
+  );
+
+  const storedHash = inspectResult.status === 0 ? inspectResult.stdout.trim() || null : null;
+
+  if (storedHash === currentHash) {
+    logger.info(`Docker image ${imageTag} is up to date — skipping build`);
+    return;
+  }
+
+  const reason = storedHash === null ? 'image not found or no hash label' : 'Dockerfile has changed';
+  logger.info(`Building Docker image ${imageTag} (reason: ${reason})`);
+
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(
+      'docker',
+      [
+        'build',
+        '--no-cache',
+        '--label', `symphony.dockerfile-hash=${currentHash}`,
+        '-t', imageTag,
+        '-f', dockerfilePath,
+        '.',
+      ],
+      { stdio: 'inherit' },
+    );
+    child.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`docker build failed (exit ${code})`));
+    });
+    child.on('error', reject);
+  });
+
+  logger.info(`Docker image ${imageTag} built successfully`);
 }
 
 function readClaudeCredentials(configuredAuthMount: string | undefined): string | null {

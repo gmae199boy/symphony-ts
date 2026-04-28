@@ -31,7 +31,7 @@
  *           timeout_ms: 300000
  *
  *   agents:
- *     max_concurrent: 10
+ *     max_containers: 10
  *     review:
  *       rounds: 2
  *       kinds:
@@ -50,6 +50,7 @@
  * 단일 요소 `trackers` 배열로 정규화됩니다.
  */
 
+import path from 'node:path';
 import { z } from 'zod';
 
 // ---------------------------------------------------------------------------
@@ -122,9 +123,40 @@ const bitbucketRepositorySchema = z.object({
   hooks: repositoryHooksSchema,
 });
 
+// ---------------------------------------------------------------------------
+// 브랜치 전략
+// ---------------------------------------------------------------------------
+
+/** 브랜치명으로 허용되는 문자 패턴: 영숫자·점·하이픈·슬래시만 허용, 최대 100자. */
+const branchNameSchema = z
+  .string()
+  .regex(
+    /^[a-zA-Z0-9][a-zA-Z0-9._\-\/]*$/,
+    '브랜치명은 영숫자로 시작하고 영숫자·점(.)·하이픈(-)·슬래시(/)만 포함할 수 있습니다.',
+  )
+  .max(100, '브랜치명은 100자를 초과할 수 없습니다.');
+
+const branchStrategySchema = z.object({
+  /** 운영 브랜치 이름 (PR 대상). 기본값: main */
+  production: branchNameSchema.default('main'),
+  /** 개발 브랜치 이름 (일반 작업 기준). 기본값: main */
+  development: branchNameSchema.default('main'),
+  /** 핫픽스로 감지할 이슈 레이블 목록. 기본값: ['hotfix'] */
+  hotfix_labels: z.array(z.string().min(1, '핫픽스 레이블은 빈 문자열일 수 없습니다.')).default(['hotfix']),
+  /**
+   * true 시 development와 production이 동일한 경우 경고 로그를 출력합니다.
+   * 기본값: true
+   */
+  protect_production: z.boolean().default(true),
+}).default({});
+
+export type BranchStrategyConfig = z.infer<typeof branchStrategySchema>;
+
 const baseRepositoryExtensions = {
   /** 이 저장소에 매핑되는 이슈 레이블. 다중 저장소 설정에서 사용합니다. */
   issue_labels: z.array(z.string()).default([]),
+  /** 브랜치 전략 설정 (운영/개발 브랜치 분리, 핫픽스 감지). */
+  branch_strategy: branchStrategySchema,
 };
 
 export const repositorySchema = z.discriminatedUnion('kind', [
@@ -241,8 +273,8 @@ const claudeAgentSchema = z.object({
   command: z.string().default('claude'),
   /** 단계별 모델 선택 (계획 vs 구현). */
   models: agentModelsSchema,
-  /** 최대 에이전트 턴 수 (CLI --max-turns에 전달). 생략 시 무제한 (Claude CLI 기본값). */
-  max_turns: z.number().int().positive().optional(),
+  /** 최대 에이전트 턴 수 (CLI --max-turns에 전달). */
+  max_turns: z.number().int().positive().default(100),
   /** 턴당 선택적 지출 한도 (USD). */
   max_budget_usd: z.number().positive().optional(),
   /** MCP 서버 설정 JSON 파일 경로. */
@@ -333,6 +365,8 @@ const slackSchema = z.object({
   bot_token: envString,
   app_token: envString,   // 앱 레벨 토큰 (xapp-...) — Socket Mode 연결에 필요
   channel: envString,
+  /** snippet 파일 사이 딜레이 (ms). Slack rate limit 준수용. */
+  inter_file_delay_ms: z.number().int().nonnegative().default(1_000),
 }).optional();
 
 export type SlackConfig = z.infer<typeof slackSchema>;
@@ -341,16 +375,60 @@ export type SlackConfig = z.infer<typeof slackSchema>;
 // 에이전트 (통합: 백엔드 + 동시성 + 리뷰)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// semgrep 정적 분석 설정
+// ---------------------------------------------------------------------------
+
+const semgrepSeverityLevelSchema = z.enum(['BLOCKER', 'SUGGESTION', 'NIT']);
+
+const semgrepSchema = z.object({
+  /** semgrep 바이너리 경로 또는 이름. */
+  command: z.string().default('semgrep'),
+  /** semgrep 규칙 설정. 예: "p/default", "p/security-audit", "auto". */
+  config: z.array(z.string()).min(1).default(['p/default']),
+  /** 스캔 대상 경로 (워크스페이스 루트 기준 상대경로). 절대경로 및 .. 경로 탈출 불허. */
+  paths: z.array(
+    z.string().refine(
+      (p) => !path.isAbsolute(p) && !p.split('/').includes('..'),
+      { message: 'paths 항목은 상대경로여야 하며 .. 를 포함할 수 없습니다' },
+    ),
+  ).default(['.']),
+  /** semgrep 실행 타임아웃 (ms). */
+  timeout_ms: z.number().int().positive().default(300_000),
+  /** semgrep severity → 리뷰 severity 매핑. */
+  severity_map: z.object({
+    ERROR: semgrepSeverityLevelSchema.default('BLOCKER'),
+    WARNING: semgrepSeverityLevelSchema.default('SUGGESTION'),
+    INFO: semgrepSeverityLevelSchema.default('NIT'),
+  }).default({}),
+  /**
+   * semgrep App 토큰. 설정 시 SEMGREP_APP_TOKEN 환경변수로 주입되어 auto 모드/프리미엄 룰셋이 활성화된다.
+   * semgrep.dev 토큰 생성: https://semgrep.dev/orgs/-/settings/tokens
+   */
+  app_token: z.preprocess(
+    (v) => (typeof v === 'string' ? resolveEnv(v) : v),
+    z.string().optional().refine(
+      (v) => v === undefined || v.trim().length > 0,
+      { message: 'app_token은 비어있을 수 없습니다' },
+    ),
+  ),
+});
+
+export { semgrepSchema };
+export type SemgrepConfig = z.infer<typeof semgrepSchema>;
+
 const reviewSchema = z.object({
   /** 에이전트당 리뷰 라운드 수. */
   rounds: z.number().int().min(1).max(5).default(2),
   /** 리뷰 세션을 실행할 에이전트 백엔드 종류 (병렬 실행). backends[].kind와 일치해야 합니다. */
   kinds: z.array(z.string()).min(1).default(['claude']),
+  /** semgrep 정적 분석 설정. 생략 시 semgrep을 실행하지 않습니다. */
+  semgrep: semgrepSchema.optional(),
 });
 
 const agentsSchema = z.object({
-  /** 동시에 실행할 수 있는 최대 에이전트 수. */
-  max_concurrent: z.number().int().positive().default(10),
+  /** 동시에 존재할 수 있는 최대 컨테이너(=활성 이슈) 수. */
+  max_containers: z.number().int().positive().default(10),
   /** 재시도 간 지연 시간 (ms). */
   retry_backoff_ms: z.number().int().positive().default(5_000),
   /** 이슈당 최대 재시도 횟수. */

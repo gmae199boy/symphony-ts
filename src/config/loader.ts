@@ -1,8 +1,10 @@
 /**
- * Loads and parses WORKFLOW.md.
+ * Loads and parses workflow configuration.
  *
- * WORKFLOW.md uses YAML front-matter (between --- delimiters) for config and
- * the remaining content as the Liquid prompt template.
+ * Supports two layouts:
+ *   1. Split (preferred): symphony.yaml in the same directory as WORKFLOW.md
+ *      — config lives in symphony.yaml, WORKFLOW.md is a pure Liquid template.
+ *   2. Legacy: WORKFLOW.md with YAML front-matter (--- ... ---) followed by the template.
  */
 
 import fs from 'node:fs';
@@ -19,12 +21,25 @@ export interface WorkflowFile {
 let cached: WorkflowFile | null = null;
 
 /**
- * Load and parse WORKFLOW.md from `filePath`.
+ * Load and parse workflow config from `filePath` (path to WORKFLOW.md).
  * Results are cached — call `reloadConfig()` to force a fresh load.
+ *
+ * If `symphony.yaml` exists alongside WORKFLOW.md it is used for config and
+ * WORKFLOW.md is treated as a pure Liquid template. Otherwise the legacy
+ * YAML front-matter layout is used.
  */
 export function loadWorkflow(filePath: string): WorkflowFile {
   if (cached) return cached;
-  cached = parseWorkflowFile(filePath);
+
+  const absTemplatePath = path.resolve(filePath);
+  const configPath = path.join(path.dirname(absTemplatePath), 'symphony.yaml');
+
+  if (fs.existsSync(configPath)) {
+    cached = parseWorkflowSplit(configPath, absTemplatePath);
+  } else {
+    cached = parseWorkflowFile(absTemplatePath);
+  }
+
   return cached;
 }
 
@@ -42,14 +57,48 @@ export function getConfig(): Config {
 // Parsing
 // ---------------------------------------------------------------------------
 
-function parseWorkflowFile(filePath: string): WorkflowFile {
-  const absPath = path.resolve(filePath);
-
-  if (!fs.existsSync(absPath)) {
-    throw new Error(`WORKFLOW.md not found: ${absPath}`);
+function parseWorkflowSplit(configPath: string, templatePath: string): WorkflowFile {
+  if (!fs.existsSync(configPath)) {
+    throw new Error(`symphony.yaml not found: ${configPath}`);
+  }
+  if (!fs.existsSync(templatePath)) {
+    throw new Error(`WORKFLOW.md not found: ${templatePath}`);
   }
 
-  const raw = fs.readFileSync(absPath, 'utf8');
+  let yamlObj: unknown;
+  try {
+    yamlObj = parseYaml(fs.readFileSync(configPath, 'utf8'));
+  } catch (err) {
+    throw new Error(`Failed to parse symphony.yaml: ${String(err)}`);
+  }
+
+  checkDeprecatedKeys(yamlObj, configPath);
+  const result = configSchema.safeParse(yamlObj);
+  if (!result.success) {
+    const issues = result.error.issues
+      .map((i) => `  ${i.path.join('.')}: ${i.message}`)
+      .join('\n');
+    throw new Error(`symphony.yaml config validation failed:\n${issues}`);
+  }
+
+  const templateRaw = fs.readFileSync(templatePath, 'utf8');
+  const { body } = splitFrontMatter(templateRaw);
+
+  cleanupSensitiveEnv();
+  logger.info('Loaded config from symphony.yaml', { configPath, templatePath });
+
+  return {
+    config: result.data,
+    promptTemplate: body.trim(),
+  };
+}
+
+function parseWorkflowFile(filePath: string): WorkflowFile {
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`WORKFLOW.md not found: ${filePath}`);
+  }
+
+  const raw = fs.readFileSync(filePath, 'utf8');
   const { frontMatter, body } = splitFrontMatter(raw);
 
   if (!frontMatter) {
@@ -63,6 +112,7 @@ function parseWorkflowFile(filePath: string): WorkflowFile {
     throw new Error(`Failed to parse WORKFLOW.md YAML front-matter: ${String(err)}`);
   }
 
+  checkDeprecatedKeys(yamlObj, filePath);
   const result = configSchema.safeParse(yamlObj);
 
   if (!result.success) {
@@ -72,12 +122,35 @@ function parseWorkflowFile(filePath: string): WorkflowFile {
     throw new Error(`WORKFLOW.md config validation failed:\n${issues}`);
   }
 
-  logger.info('Loaded WORKFLOW.md config', { path: absPath });
+  cleanupSensitiveEnv();
+  logger.info('Loaded WORKFLOW.md config', { path: filePath });
 
   return {
     config: result.data,
     promptTemplate: body.trim(),
   };
+}
+
+/** config 파싱 완료 후 부모 프로세스 env에서 민감 토큰을 제거한다 (defense-in-depth). */
+function cleanupSensitiveEnv(): void {
+  // SEMGREP_APP_TOKEN은 config.app_token으로 이미 캡처됨.
+  // 이후 semgrep-runner는 options.env로 자식 프로세스에 명시적 전달 — 부모 env 불필요.
+  delete process.env['SEMGREP_APP_TOKEN'];
+}
+
+/**
+ * 구 설정 키 사용 여부를 검사하고 발견 시 fatal 에러를 던진다.
+ * 무성 regression(잘못된 키가 zod에서 무시되어 기본값으로 폴백)을 방지한다.
+ */
+function checkDeprecatedKeys(raw: unknown, filePath: string): void {
+  if (typeof raw !== 'object' || raw === null) return;
+  const agents = (raw as Record<string, unknown>)['agents'];
+  if (typeof agents === 'object' && agents !== null && 'max_concurrent' in agents) {
+    throw new Error(
+      `[${filePath}] 'agents.max_concurrent' is no longer supported. ` +
+      `Please rename it to 'agents.max_containers' in your config file.`,
+    );
+  }
 }
 
 /**

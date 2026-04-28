@@ -131,7 +131,7 @@ export class GitHubClient {
     }
   }
 
-  async deleteBranch(branchName: string): Promise<void> {
+  async deleteBranch(branchName: string): Promise<boolean> {
     const url = `${GITHUB_API}/repos/${this.config.repo}/git/refs/heads/${encodeURIComponent(branchName)}`;
     const token = await this.resolveToken();
     const headers: Record<string, string> = {
@@ -146,10 +146,13 @@ export class GitHubClient {
       signal: AbortSignal.timeout(30_000),
     }, GITHUB_RETRY_OPTS);
 
-    if (!response.ok && response.status !== 404 && response.status !== 422) {
+    if (response.status === 404 || response.status === 422) return false;
+    if (!response.ok) {
       const body = await response.text().catch(() => '');
       logger.warn(`GitHub deleteBranch failed: ${response.status} ${body.slice(0, 300)}`);
+      return false;
     }
+    return true;
   }
 
   async fetchPRComments(prNumber: number): Promise<Comment[]> {

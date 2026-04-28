@@ -26,9 +26,10 @@ export class DockerWorkspaceIO implements WorkspaceIO {
     await dockerExecWrite(ref.containerName, fullPath, content);
   }
 
-  async getDiff(ref: WorkspaceRef, base?: string): Promise<string | null> {
+  async getDiff(ref: WorkspaceRef, base?: string, baseBranch?: string): Promise<string | null> {
     if (!ref.containerName) return null;
-    const range = base ? `${base}..HEAD` : 'origin/main...HEAD';
+    const fallback = baseBranch ? `origin/${baseBranch}...HEAD` : 'origin/main...HEAD';
+    const range = base ? `${base}..HEAD` : fallback;
     const proc = await spawnAsync('docker', [
       'exec', '--user', 'worker', ref.containerName,
       'bash', '-lc', `cd /workspace && git diff ${range}`,

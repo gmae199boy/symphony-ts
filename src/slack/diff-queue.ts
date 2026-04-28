@@ -19,10 +19,10 @@ const DiffFileSchema = z.object({
   status: z.enum(['added', 'modified', 'deleted']),
   additions: z.number(),
   deletions: z.number(),
-  /** 사전 분할된 Slack 메시지 청크 (코드블록 포함). */
-  chunks: z.array(z.string()),
-  /** 청크별 전송 완료 여부. */
-  sent_chunks: z.array(z.boolean()),
+  /** 원시 unified diff 본문 텍스트 (snippet 업로드용). */
+  content: z.string().max(2_000_000),
+  /** snippet 업로드 완료 여부. */
+  upload_sent: z.boolean(),
 });
 
 export type DiffFile = z.infer<typeof DiffFileSchema>;
@@ -43,6 +43,46 @@ export type DiffQueueRecord = z.infer<typeof DiffQueueRecordSchema>;
 const DiffQueueStoreSchema = z.array(z.tuple([z.string(), DiffQueueRecordSchema]));
 
 // ---------------------------------------------------------------------------
+// Legacy schema migration (chunks[] → content)
+// ---------------------------------------------------------------------------
+
+const LegacyDiffFileSchema = z.object({
+  path: z.string(),
+  status: z.enum(['added', 'modified', 'deleted']),
+  additions: z.number(),
+  deletions: z.number(),
+  chunks: z.array(z.string()),
+  sent_chunks: z.array(z.boolean()),
+});
+
+const LegacyRecordSchema = z.object({
+  issueIdentifier: z.string(),
+  pr_url: z.string(),
+  pr_number: z.number(),
+  thread_ts: z.string(),
+  channel: z.string(),
+  summary_sent: z.boolean(),
+  files: z.array(LegacyDiffFileSchema),
+  approval_sent: z.boolean(),
+});
+
+const LegacyStoreSchema = z.array(z.tuple([z.string(), LegacyRecordSchema]));
+
+function migrateLegacyRecord(rec: z.infer<typeof LegacyRecordSchema>): DiffQueueRecord {
+  return {
+    ...rec,
+    files: rec.files.map(f => ({
+      path: f.path,
+      status: f.status,
+      additions: f.additions,
+      deletions: f.deletions,
+      content: f.chunks.join('\n').slice(0, 2_000_000),
+      upload_sent: f.sent_chunks.length > 0 && f.sent_chunks.every(Boolean),
+    })),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Store
 // ---------------------------------------------------------------------------
 
@@ -57,13 +97,35 @@ export class DiffQueueStore {
   load(): void {
     try {
       const raw = fs.readFileSync(this.filePath, 'utf8');
-      const parsed = DiffQueueStoreSchema.safeParse(JSON.parse(raw));
-      if (!parsed.success) {
-        logger.warn('DiffQueueStore: corrupted data, starting fresh', { error: parsed.error.message });
-        this.records = new Map();
+      const json = JSON.parse(raw);
+
+      const parsed = DiffQueueStoreSchema.safeParse(json);
+      if (parsed.success) {
+        this.records = new Map(parsed.data);
         return;
       }
-      this.records = new Map(parsed.data);
+
+      // 구버전 포맷(chunks[]) 마이그레이션 시도
+      const legacy = LegacyStoreSchema.safeParse(json);
+      if (legacy.success) {
+        logger.info('DiffQueueStore: migrating legacy chunk format to content format');
+        this.records = new Map(legacy.data.map(([id, rec]) => [id, migrateLegacyRecord(rec)]));
+        this.save();
+        return;
+      }
+
+      // 복구 불가: 기존 파일 백업 후 초기화
+      const backupPath = this.filePath + '.bak';
+      try {
+        fs.copyFileSync(this.filePath, backupPath);
+        logger.warn('DiffQueueStore: corrupted data backed up, starting fresh', {
+          error: parsed.error.message,
+          backupPath,
+        });
+      } catch {
+        logger.warn('DiffQueueStore: corrupted data, starting fresh', { error: parsed.error.message });
+      }
+      this.records = new Map();
     } catch {
       this.records = new Map();
     }

@@ -140,7 +140,7 @@ export interface WorkspaceRef {
 }
 
 export interface WorkspaceBackend {
-  create(issue: Issue, workerHost?: string): Promise<WorkspaceRef>;
+  create(issue: Issue, workerHost?: string, baseBranch?: string): Promise<WorkspaceRef>;
   runBeforeRunHook(ref: WorkspaceRef, issue: Issue): Promise<void>;
   runAfterRunHook(ref: WorkspaceRef, issue: Issue): Promise<void>;
   cleanup(ref: WorkspaceRef, issue: Issue): Promise<void>;
@@ -155,8 +155,8 @@ export interface WorkspaceIO {
   readFile(ref: WorkspaceRef, relativePath: string): Promise<string | null>;
   /** 워크스페이스 루트 기준 상대 경로로 파일 쓰기. 상위 디렉토리 자동 생성. */
   writeFile(ref: WorkspaceRef, relativePath: string, content: string): Promise<void>;
-  /** git diff 조회. base가 제공되면 해당 커밋에서 HEAD까지의 diff 반환; 없으면 전체 PR diff (origin/main...HEAD) 반환. */
-  getDiff(ref: WorkspaceRef, base?: string): Promise<string | null>;
+  /** git diff 조회. base가 제공되면 해당 커밋에서 HEAD까지의 diff 반환; 없으면 전체 PR diff (origin/<baseBranch>...HEAD) 반환. baseBranch 미제공 시 'main'으로 폴백. */
+  getDiff(ref: WorkspaceRef, base?: string, baseBranch?: string): Promise<string | null>;
   /** 현재 HEAD 커밋 해시 반환. git 저장소가 아니거나 실패 시 null. */
   getCommitHash(ref: WorkspaceRef): Promise<string | null>;
   /** 워크스페이스 존재 여부 확인 (컨테이너 실행 중 / 디렉토리 존재). */

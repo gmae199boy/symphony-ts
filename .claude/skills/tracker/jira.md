@@ -52,6 +52,7 @@ curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" -X PUT \
 
 ## Notes
 
+- Do NOT create new Jira issues. Out-of-scope findings found during review must be included in `pending_review.md` under `## Additional Findings (Out of Scope)`, not registered as new tracker items.
 - Do NOT fetch issue fields from Jira. All issue context (title, description, status, labels) is provided in the prompt.
 - You MAY fetch issue comments to find the existing workpad (`## Agent Workpad`).
 - Jira uses transitions (not direct state changes). Always fetch available transitions first.

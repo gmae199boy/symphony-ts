@@ -9,7 +9,7 @@
 |------|------|
 | Runtime | Node.js 24+, TypeScript |
 | AI Agent | Claude Code CLI |
-| 이슈 트래커 | Jira |
+| 이슈 트래커 | Jira / Linear |
 | 코드 저장소 | Bitbucket |
 | 승인 채널 | Slack (Socket Mode) |
 | 워크스페이스 | Docker 컨테이너 / 로컬 디렉토리 |
@@ -20,13 +20,14 @@
 
 ```bash
 pnpm install
-cp .env.example .env   # 토큰 입력
+cp .env.example .env                     # 토큰 입력
+cp symphony.example.yaml symphony.yaml   # 설정 입력
 pnpm run build
 pnpm start
 ```
 
 ## 문서
 
-- [설정 가이드 (SETUP.md)](docs/SETUP.md) — 환경변수, WORKFLOW.md 설정, Slack 앱 설정
+- [설정 가이드 (SETUP.md)](docs/SETUP.md) — 환경변수, symphony.yaml 설정, Slack 앱 설정
 - [아키텍처 (ARCHITECTURE.md)](docs/ARCHITECTURE.md) — 시스템 구조 및 설계
-- [전체 설정 예시 (WORKFLOW.example.yml)](WORKFLOW.example.yml)
+- [전체 설정 예시 (symphony.example.yaml)](symphony.example.yaml)

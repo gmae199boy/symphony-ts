@@ -1,52 +1,32 @@
 /**
- * Slack notifier — sends messages to Slack channels/threads.
+ * Slack notifier — @slack/web-api WebClient로 메시지를 전송한다.
  */
 
-import { z } from 'zod';
+import type { WebClient } from '@slack/web-api';
 import { logger } from '../logger.js';
-import { fetchWithRetry } from '../fetch-retry.js';
-
-const SlackPostMessageResponseSchema = z.object({
-  ok: z.boolean(),
-  ts: z.string().optional(),
-  channel: z.string().optional(),
-  error: z.string().optional(),
-});
 
 export async function sendSlackMessage(
-  botToken: string,
+  client: WebClient,
   channel: string,
   text: string,
   threadTs?: string,
 ): Promise<{ ts: string; channel: string } | null> {
   try {
-    const body: Record<string, string> = { channel, text };
-    if (threadTs) body.thread_ts = threadTs;
-
-    const resp = await fetchWithRetry('https://slack.com/api/chat.postMessage', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${botToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(body),
+    const result = await client.chat.postMessage({
+      channel,
+      text,
+      ...(threadTs ? { thread_ts: threadTs } : {}),
     });
 
-    const parsed = SlackPostMessageResponseSchema.safeParse(await resp.json());
-    if (!parsed.success) {
-      logger.warn('Slack postMessage: unexpected response shape', { error: parsed.error.message });
+    if (!result.ok) {
+      logger.warn('Slack postMessage failed', { error: result.error, channel, threadTs });
       return null;
     }
-    const data = parsed.data;
-    if (!data.ok) {
-      logger.warn('Slack postMessage failed', { error: data.error, channel, threadTs });
-      return null;
-    }
-    if (!data.ts) {
+    if (!result.ts) {
       logger.warn('Slack postMessage: ok but no ts', { channel });
       return null;
     }
-    return { ts: data.ts, channel: data.channel ?? channel };
+    return { ts: result.ts, channel: (result.channel as string | undefined) ?? channel };
   } catch (err) {
     logger.warn('Failed to send Slack message', { error: String(err) });
     return null;
@@ -54,29 +34,24 @@ export async function sendSlackMessage(
 }
 
 /**
- * Send a long message, splitting by '---' section boundaries if it exceeds
- * Slack's ~40 000 character limit.  Each chunk is sent as a thread reply.
- *
- * @param onMessageSent - called after each chunk is sent so the caller can
- *        update last_read_ts to prevent the Slack poller from picking up
- *        bot-sent chunks as user messages.
+ * 긴 메시지를 '---' 섹션 경계로 분할하여 순차적으로 전송한다.
+ * 각 청크는 스레드 답글로 전송된다.
  */
 export async function sendSlackMessageChunked(
-  botToken: string,
+  client: WebClient,
   channel: string,
   text: string,
   threadTs?: string,
   onMessageSent?: (ts: string) => void,
 ): Promise<{ ts: string; channel: string } | null> {
-  const MAX_LENGTH = 39_000; // leave headroom below Slack's 40 000 limit
+  const MAX_LENGTH = 39_000;
 
   if (text.length <= MAX_LENGTH) {
-    const result = await sendSlackMessage(botToken, channel, text, threadTs);
+    const result = await sendSlackMessage(client, channel, text, threadTs);
     if (result) onMessageSent?.(result.ts);
     return result;
   }
 
-  // Split on finding boundaries (--- separator)
   const sections = text.split('\n---\n');
   const chunks: string[] = [];
   let current = '';
@@ -95,7 +70,7 @@ export async function sendSlackMessageChunked(
 
   for (let i = 0; i < chunks.length; i++) {
     const prefix = chunks.length > 1 ? `(${i + 1}/${chunks.length})\n\n` : '';
-    const result = await sendSlackMessage(botToken, channel, prefix + chunks[i], threadTs);
+    const result = await sendSlackMessage(client, channel, prefix + chunks[i], threadTs);
     if (result) {
       onMessageSent?.(result.ts);
       lastResult = result;

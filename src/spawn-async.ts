@@ -22,6 +22,10 @@ export interface SpawnAsyncOptions {
   timeoutMs?: number;
   /** Encoding for stdout/stderr (always utf8). */
   encoding?: BufferEncoding;
+  /** SIGTERM 전송 후 SIGKILL까지 대기할 시간 (ms). 미설정 시 SIGKILL 전송 안 함. */
+  killTimeoutMs?: number;
+  /** 자식 프로세스에 전달할 환경변수. 미설정 시 부모 process.env 상속. */
+  env?: NodeJS.ProcessEnv;
 }
 
 export function spawnAsync(
@@ -33,6 +37,7 @@ export function spawnAsync(
     const child = spawn(command, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: options.cwd,
+      env: options.env,
     });
 
     const stdoutChunks: Buffer[] = [];
@@ -44,6 +49,9 @@ export function spawnAsync(
       timer = setTimeout(() => {
         timedOut = true;
         child.kill('SIGTERM');
+        if (options.killTimeoutMs != null && options.killTimeoutMs > 0) {
+          setTimeout(() => child.kill('SIGKILL'), options.killTimeoutMs);
+        }
       }, options.timeoutMs);
     }
 

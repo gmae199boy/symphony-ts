@@ -4,6 +4,7 @@
  * Implementation: SlackChannel.
  */
 
+import type { WebClient } from '@slack/web-api';
 import type { Issue, FeedbackResponseEvent } from '../types.js';
 
 export type ApprovalType = 'plan' | 'review' | 'question';
@@ -12,8 +13,8 @@ export type HumanResponseHandler = (event: FeedbackResponseEvent) => void;
 export interface HumanChannel {
   /** Start the channel (begin polling, etc). */
   start(): Promise<void>;
-  /** Stop the channel. */
-  stop(): void;
+  /** Stop the channel and await clean shutdown. */
+  stop(): Promise<void>;
 
   /**
    * Send content to a human for approval or feedback.
@@ -60,4 +61,7 @@ export interface HumanChannel {
 
   /** Increment and return the plan revision number for the given issue. */
   incrementPlanNumber(issueIdentifier: string): number;
+
+  /** Expose the underlying WebClient for components that need direct REST access (e.g. DiffSender). */
+  getWebClient(): WebClient;
 }

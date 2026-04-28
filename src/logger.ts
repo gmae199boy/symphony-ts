@@ -24,9 +24,9 @@ export function removeFileSink(s: LogSink): void {
   if (i >= 0) fileSinks.splice(i, 1);
 }
 
-type LogLevel = 'debug' | 'info' | 'warning' | 'error';
+type LogLevel = 'debug' | 'info' | 'notice' | 'warning' | 'error';
 
-const LEVELS: Record<LogLevel, number> = { debug: 0, info: 1, warning: 2, error: 3 };
+const LEVELS: Record<LogLevel, number> = { debug: 0, info: 1, notice: 1, warning: 2, error: 3 };
 const minLevel = LEVELS[(process.env.LOG_LEVEL as LogLevel) ?? 'info'] ?? 1;
 
 // ---------------------------------------------------------------------------
@@ -49,6 +49,9 @@ const ANSI_RESET = '\x1b[0m';
 const LEVEL_COLORS: Partial<Record<LogLevel, string>> = {
   error: '\x1b[31m',
   warning: '\x1b[33m',
+};
+const FULL_LINE_COLORS: Partial<Record<LogLevel, string>> = {
+  notice: '\x1b[31m',
 };
 
 const issueColorCache = new Map<string, string>();
@@ -97,7 +100,8 @@ function log(level: LogLevel, message: string, meta?: Record<string, unknown>): 
   const ts = `${hh}:${mm}:${ss}.${ms}`;
   const metaStr = meta ? ' ' + JSON.stringify(meta) : '';
 
-  const levelColor = LEVEL_COLORS[level] ?? '';
+  const lineColor = FULL_LINE_COLORS[level] ?? '';
+  const levelColor = lineColor ? '' : (LEVEL_COLORS[level] ?? '');
   const levelReset = levelColor ? ANSI_RESET : '';
 
   const identifier = logContext.getStore()?.identifier;
@@ -106,15 +110,20 @@ function log(level: LogLevel, message: string, meta?: Record<string, unknown>): 
     : '';
 
   const out = level === 'error' ? process.stderr : process.stdout;
-  out.write(`${ts} ${levelColor}[${level}]${levelReset} ${issuePrefix}${message}${metaStr}\n`);
+  if (lineColor) {
+    out.write(`${lineColor}${ts} [${level}] ${message}${metaStr}${ANSI_RESET}\n`);
+  } else {
+    out.write(`${ts} ${levelColor}[${level}]${levelReset} ${issuePrefix}${message}${metaStr}\n`);
+  }
 
   // 파일 싱크에는 색상 없는 일반 출력 전달
   for (const fs of fileSinks) fs.log(level, message, meta);
 }
 
 export const logger = {
-  debug: (msg: string, meta?: Record<string, unknown>) => log('debug',   msg, meta),
-  info:  (msg: string, meta?: Record<string, unknown>) => log('info',    msg, meta),
-  warn:  (msg: string, meta?: Record<string, unknown>) => log('warning', msg, meta),
-  error: (msg: string, meta?: Record<string, unknown>) => log('error',   msg, meta),
+  debug:  (msg: string, meta?: Record<string, unknown>) => log('debug',   msg, meta),
+  info:   (msg: string, meta?: Record<string, unknown>) => log('info',    msg, meta),
+  notice: (msg: string, meta?: Record<string, unknown>) => log('notice',  msg, meta),
+  warn:   (msg: string, meta?: Record<string, unknown>) => log('warning', msg, meta),
+  error:  (msg: string, meta?: Record<string, unknown>) => log('error',   msg, meta),
 };

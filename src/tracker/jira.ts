@@ -95,6 +95,7 @@ const JiraCommentsResponseSchema = z.object({
 const JiraTransitionSchema = z.object({
   id: z.string(),
   name: z.string(),
+  to: z.object({ name: z.string() }).optional(),
 });
 
 const JiraTransitionsResponseSchema = z.object({
@@ -201,14 +202,19 @@ export class JiraClient implements TrackerClient {
     const transRaw = await this.request('GET', `/rest/api/3/issue/${id}/transitions`);
     const transData = JiraTransitionsResponseSchema.parse(JSON.parse(transRaw));
 
+    const norm = toState.toLowerCase().trim();
     const target = transData.transitions.find(
-      (t) => t.name.toLowerCase().trim() === toState.toLowerCase().trim(),
+      (t) =>
+        t.name.toLowerCase().trim() === norm ||
+        t.to?.name.toLowerCase().trim() === norm,
     );
 
     if (!target) {
-      const available = transData.transitions.map((t) => t.name).join(', ');
+      const available = transData.transitions
+        .map((t) => `${t.name}${t.to ? ` → ${t.to.name}` : ''}`)
+        .join(', ');
       throw new Error(
-        `Jira: no transition named "${toState}" available for issue ${id}. Available: [${available}]`,
+        `Jira: no transition to "${toState}" available for issue ${id}. Available: [${available}]`,
       );
     }
 

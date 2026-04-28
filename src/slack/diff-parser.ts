@@ -1,21 +1,27 @@
 /**
- * Unified diff → 파일별 청크 파싱.
+ * Unified diff → 파일별 DiffFile 파싱.
  *
- * `git diff origin/main...HEAD` 출력을 파일별로 분리하고,
- * Slack 메시지 크기 제한에 맞게 청크를 사전 분할한다.
+ * `git diff origin/main...HEAD` 출력을 파일별로 분리한다.
+ * Slack snippet 업로드용으로 파일당 content 문자열을 반환하며,
+ * 1500라인 또는 900KB 초과 시 part N/M 접미사로 분할한다.
  */
 
 import type { DiffFile } from './diff-queue.js';
 
-/** Slack 메시지 한 청크의 최대 문자 수 (헤더 + 코드블록 감싸기 여유 포함). */
-const MAX_CHUNK_CHARS = 3_500;
+/** Slack snippet 1개당 최대 라인 수. */
+const MAX_LINES_PER_PART = 1_500;
+/** Slack snippet 1MB 한도의 안전 마진 (바이트). */
+const MAX_BYTES_PER_PART = 900_000;
+/** 단일 파일당 최대 파트 수 — 초과 시 처음 N개 파트만 업로드하고 절단 표시. */
+const MAX_PARTS_PER_FILE = 50;
 
 /**
  * raw unified diff를 파일별 DiffFile 배열로 파싱한다.
+ * 매우 큰 파일은 여러 DiffFile 레코드(part 1/N, 2/N, …)로 분할된다.
  */
 export function parseDiffToFiles(rawDiff: string): DiffFile[] {
   const fileDiffs = splitByFile(rawDiff);
-  return fileDiffs.map(parseSingleFile);
+  return fileDiffs.flatMap(parseSingleFile);
 }
 
 // ---------------------------------------------------------------------------
@@ -32,7 +38,6 @@ interface RawFileDiff {
 /** diff --git a/... b/... 기준으로 파일별 분리. */
 function splitByFile(rawDiff: string): RawFileDiff[] {
   const parts: RawFileDiff[] = [];
-  // diff --git a/path b/path 패턴으로 분리
   const regex = /^diff --git a\/(.+?) b\/(.+?)$/gm;
   const matches = [...rawDiff.matchAll(regex)];
 
@@ -42,14 +47,13 @@ function splitByFile(rawDiff: string): RawFileDiff[] {
     const end = i + 1 < matches.length ? matches[i + 1].index! : rawDiff.length;
     const section = rawDiff.slice(start, end);
 
-    // header: diff --git 부터 첫 @@ 까지 (또는 전체)
     const hhIdx = section.indexOf('\n@@');
     const header = hhIdx >= 0 ? section.slice(0, hhIdx) : section;
     const body = hhIdx >= 0 ? section.slice(hhIdx + 1) : '';
 
     parts.push({
       header,
-      path: match[2], // b/ 경로 (rename 대응)
+      path: match[2],
       oldPath: match[1],
       body,
     });
@@ -58,22 +62,29 @@ function splitByFile(rawDiff: string): RawFileDiff[] {
   return parts;
 }
 
-function parseSingleFile(raw: RawFileDiff): DiffFile {
+function parseSingleFile(raw: RawFileDiff): DiffFile[] {
   const status = detectStatus(raw.header, raw.oldPath);
   const { additions, deletions } = countChanges(raw.body);
+  const content = raw.body.trim();
 
-  // diff 본문을 코드블록으로 감싸서 청크 분할
-  const diffContent = raw.body.trim();
-  const chunks = splitIntoChunks(diffContent);
+  let parts = splitContent(content);
 
-  return {
-    path: raw.path,
+  if (parts.length > MAX_PARTS_PER_FILE) {
+    parts = parts.slice(0, MAX_PARTS_PER_FILE);
+    parts[parts.length - 1] +=
+      `\n\n... (파일이 너무 커서 처음 ${MAX_PARTS_PER_FILE}개 파트만 표시합니다. PR을 직접 확인해 주세요.)`;
+  }
+
+  const totalParts = parts.length;
+
+  return parts.map((partContent, i) => ({
+    path: totalParts > 1 ? `${raw.path} (part ${i + 1}/${totalParts})` : raw.path,
     status,
     additions,
     deletions,
-    chunks,
-    sent_chunks: chunks.map(() => false),
-  };
+    content: partContent || '(empty diff)',
+    upload_sent: false,
+  }));
 }
 
 function detectStatus(header: string, oldPath: string): 'added' | 'modified' | 'deleted' {
@@ -94,37 +105,42 @@ function countChanges(body: string): { additions: number; deletions: number } {
 }
 
 /**
- * diff 본문을 Slack 코드블록(```diff ... ```)으로 감싸고,
- * MAX_CHUNK_CHARS를 초과하면 라인 경계에서 분할한다.
+ * diff 본문을 라인/바이트 상한 기준으로 분할한다.
+ * 상한 미만이면 길이 1의 배열을 반환한다.
  */
-function splitIntoChunks(diffContent: string): string[] {
-  if (!diffContent) return ['_(빈 diff)_'];
+function splitContent(content: string): string[] {
+  if (!content) return [''];
 
-  const lines = diffContent.split('\n');
-  const chunks: string[] = [];
+  const rawLines = content.split('\n');
+  // split('\n')의 후행 빈 원소 제거
+  while (rawLines.length > 0 && rawLines[rawLines.length - 1] === '') {
+    rawLines.pop();
+  }
+  const lines = rawLines;
+
+  const joined = lines.join('\n');
+  if (lines.length <= MAX_LINES_PER_PART && Buffer.byteLength(joined, 'utf8') <= MAX_BYTES_PER_PART) {
+    return [joined];
+  }
+
+  const parts: string[] = [];
   let current: string[] = [];
-  let currentLen = 0;
-  // 코드블록 감싸기 오버헤드: "```diff\n" (8) + "\n```" (4) = ~12
-  const overhead = 12;
+  let currentBytes = 0;
 
   for (const line of lines) {
-    const lineLen = line.length + 1; // +1 for newline
-    if (currentLen + lineLen + overhead > MAX_CHUNK_CHARS && current.length > 0) {
-      chunks.push(wrapCodeBlock(current.join('\n')));
+    const lineBytes = Buffer.byteLength(line + '\n', 'utf8');
+    if (
+      current.length > 0 &&
+      (current.length >= MAX_LINES_PER_PART || currentBytes + lineBytes > MAX_BYTES_PER_PART)
+    ) {
+      parts.push(current.join('\n'));
       current = [];
-      currentLen = 0;
+      currentBytes = 0;
     }
     current.push(line);
-    currentLen += lineLen;
+    currentBytes += lineBytes;
   }
 
-  if (current.length > 0) {
-    chunks.push(wrapCodeBlock(current.join('\n')));
-  }
-
-  return chunks.length > 0 ? chunks : ['_(빈 diff)_'];
-}
-
-function wrapCodeBlock(content: string): string {
-  return '```diff\n' + content + '\n```';
+  if (current.length > 0) parts.push(current.join('\n'));
+  return parts;
 }

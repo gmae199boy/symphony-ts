@@ -127,7 +127,7 @@ export class RepoPoller extends Poller {
     return this.repoClient.fetchPR(prNumber);
   }
 
-  async deleteBranch(branchName: string): Promise<void> {
+  async deleteBranch(branchName: string): Promise<boolean> {
     return this.repoClient.deleteBranch(branchName);
   }
 

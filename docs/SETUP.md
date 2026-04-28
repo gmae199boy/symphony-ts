@@ -5,7 +5,7 @@
 - [ ] Node.js 24+ 설치
 - [ ] 의존성 설치 (`pnpm install`)
 - [ ] `.env` 파일 생성
-- [ ] `WORKFLOW.md` 설정
+- [ ] `symphony.yaml` 설정
 - [ ] Slack 앱 설정
 - [ ] Docker 워커 이미지 빌드 (`workspace_backend: docker` 사용 시)
 - [ ] 빌드 및 실행
@@ -112,16 +112,19 @@ BITBUCKET_API_TOKEN=   # Bitbucket API 토큰
 
 ---
 
-## 3. WORKFLOW.md 설정
+## 3. symphony.yaml 설정
 
-프로젝트 루트의 `WORKFLOW.md` 파일을 수정한다. `---` 사이의 YAML 블록이 설정으로 파싱된다.
+`symphony.example.yaml`을 복사해서 시작:
 
-전체 예시는 `WORKFLOW.example.yml` 참조.
+```bash
+cp symphony.example.yaml symphony.yaml
+```
+
+`symphony.yaml`은 `.gitignore`에 포함되어 커밋되지 않는다. 전체 예시는 `symphony.example.yaml` 참조.
 
 ### 최소 설정 (Linear + GitHub + Claude)
 
 ```yaml
----
 workspace_backend: local
 
 trackers:
@@ -148,7 +151,6 @@ agents:
       models:
         planning: opus
         implementation: sonnet
----
 ```
 
 ### 주요 설정 옵션
@@ -250,19 +252,48 @@ trackers:
 
 라벨은 Jira 이슈 우측 패널 **Labels** 필드, Linear는 이슈의 **Labels** 항목에서 추가한다.
 
-전체 예시는 `WORKFLOW.example.yml` 참조.
+전체 예시는 `symphony.example.yaml` 참조.
+
+#### branch_strategy
+
+레포지토리별로 운영/개발 브랜치를 분리해 운영할 수 있다. `repository` 또는 `repositories[]` 안에 설정한다.
+
+```yaml
+    repository:
+      kind: github
+      repo: my-org/my-repo
+      token: $GITHUB_TOKEN
+      branch_strategy:
+        production: main        # 핫픽스 이슈의 기준 브랜치 및 PR 대상
+        development: develop    # 일반 이슈의 기준 브랜치 및 PR 대상
+        hotfix_labels: [hotfix] # 이 레이블 이슈는 production 기준으로 처리
+        protect_production: true # 비-핫픽스 이슈의 production 브랜치 사용을 경고
+```
+
+> **기본값**: `branch_strategy`를 생략하면 `production=main`, `development=main`, `hotfix_labels=[hotfix]`, `protect_production=true`가 적용된다.
 
 #### agents
 
 ```yaml
 agents:
-  max_concurrent: 10           # 동시 실행 에이전트 수 (기본값: 10)
+  max_containers: 10           # 동시에 존재할 수 있는 최대 컨테이너(=활성 이슈) 수 (기본값: 10)
   retry_backoff_ms: 5000       # 재시도 기본 백오프 (ms)
   max_retries: 2               # 에이전트 실패 시 자동 재시도 횟수 (기본값: 2)
   review:
     rounds: 2                  # 에이전트당 리뷰 라운드 수
     kinds:
       - claude                 # backends[].kind 참조
+    semgrep:                   # semgrep 정적 분석 (선택사항 — 생략 시 비활성화)
+      command: semgrep         # semgrep 바이너리 경로 (기본값: 'semgrep')
+      config:                  # 사용할 semgrep 규칙셋 (최소 1개 필수)
+        - p/default
+      paths:                   # 스캔 대상 경로 (기본값: ['.'])
+        - src
+      timeout_ms: 300000       # 스캔 타임아웃 (ms, 기본값: 5분)
+      severity_map:            # semgrep 심각도 → 셀프 리뷰 심각도 매핑
+        ERROR: BLOCKER         # 기본값
+        WARNING: SUGGESTION    # 기본값
+        INFO: NIT              # 기본값
   backends:
     - kind: claude
       primary: true            # 메인 에이전트 (계획/구현/리뷰 병합)
@@ -318,7 +349,7 @@ Symphony는 **Socket Mode(WebSocket)**로 Slack과 통신한다. 공인 IP나 Re
 
 | 항목 | 값 |
 |------|----|
-| Bot Token Scopes | `chat:write`, `channels:history`, `groups:history`, `im:history`, `reactions:read` |
+| Bot Token Scopes | `chat:write`, `files:write`, `channels:history`, `groups:history`, `im:history`, `reactions:read` |
 | Subscribe to bot events | `message.channels` (또는 `message.groups`), `message.im`, `reaction_added` |
 | Event Subscriptions | ON — Request URL 불필요 (Socket Mode가 수신) |
 | Socket Mode | ON — App-Level Token (`connections:write` scope) 발급 |
@@ -342,6 +373,8 @@ App-Level Tokens → Generate → 이름 입력 → scope: `connections:write` �
 
 좌측 메뉴 → OAuth & Permissions → Scopes → Bot Token Scopes:
 - `chat:write`
+- `files:write` — PR diff snippet 업로드용 (**신규** — 기존 앱은 스코프 추가 후 앱 재설치 필요)
+  > ⚠️ **보안 주의**: 업로드된 snippet은 워크스페이스 전체에서 검색·인덱싱·다운로드 가능하며 워크스페이스 파일 보존 정책에 따라 영구 보관됩니다. lockfile·시크릿 파일(`.env`, `*.pem`, `id_rsa` 등)은 자동으로 필터링되지만, **코드 내 하드코딩된 시크릿은 필터링되지 않습니다**. PR 병합 전 diff에 자격증명이 포함되지 않는지 반드시 확인하세요.
 - `channels:history` — 공개 채널 메시지 수신용
 - `groups:history` — 비공개 채널 사용 시 추가
 - `im:history` — 봇 DM으로 승인 메시지 수신용
@@ -572,6 +605,8 @@ claude --version
 
 ### 코드 업데이트
 
+> ⚠️ **업그레이드 주의 (diff 큐 스키마 변경)**: 이전 버전에서 업그레이드 시, 재시작 전에 `pending-diff-messages.json` 파일이 없거나 비어 있는지 확인하세요. 이전 포맷(chunks 배열)의 레코드는 자동으로 마이그레이션되지만, 마이그레이션 실패 시 미전송 diff가 손실될 수 있습니다. 손실이 우려되는 경우 재시작 전에 파일을 백업하세요.
+
 **로컬에서 원격으로 (권장):**
 ```bash
 make remote-upload
@@ -630,7 +665,7 @@ make start  # Docker 이미지 빌드 + tsc 빌드 후 재시작
 - 앱 재설치 후 재시도
 
 **이슈가 디스패치 안 됨**
-- `WORKFLOW.md`의 `states` 값이 실제 Linear/Jira 상태 이름과 정확히 일치하는지 확인
+- `symphony.yaml`의 `states` 값이 실제 Linear/Jira 상태 이름과 정확히 일치하는지 확인
 - `assignee: me` 설정 시 해당 이슈가 본인에게 할당됐는지 확인
 
 **Docker 컨테이너에서 Claude 인증 실패**

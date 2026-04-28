@@ -23,7 +23,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gh \
     sudo \
     openssh-client \
+    make \
+    python3 \
+    python3-pip \
+    python3-venv \
     && rm -rf /var/lib/apt/lists/*
+
+# semgrep 설치 (정적 분석 도구) - system-wide 설치로 worker 유저도 접근 가능
+RUN pip3 install --break-system-packages semgrep
 
 # Create a non-root worker user
 # --dangerously-skip-permissions is blocked when running as root

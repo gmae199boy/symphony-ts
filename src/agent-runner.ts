@@ -54,6 +54,8 @@ export interface RunOptions {
   claudeAuthDir?: string;
   /** PR feedback payload to write to .symphony/pr_feedback.json after container creation */
   prFeedbackPayload?: string;
+  /** 이슈 작업의 base 브랜치 (hotfix → production, 일반 → development). */
+  baseBranch?: string;
 }
 
 export interface RuntimeInfo {
@@ -123,7 +125,7 @@ async function runOnWorkerHost(
   );
 
   const workspaceBackend = createWorkspaceBackend(config, opts.repository, opts.trackerConfig);
-  const ref = await workspaceBackend.create(issue, workerHost ?? undefined);
+  const ref = await workspaceBackend.create(issue, workerHost ?? undefined, opts.baseBranch);
 
   // Per-developer Claude auth override: re-inject credentials from the specified directory.
   if (opts.claudeAuthDir && ref.containerName) {
@@ -198,6 +200,7 @@ async function runAgentTurns(
     trackerKind: opts.trackerKind,
     repositoryKind: opts.repositoryKind,
     states: opts.states,
+    baseBranch: opts.baseBranch,
   });
 
   if (agentConfig.kind === 'claude') {

@@ -7,7 +7,7 @@ Use curl + Bitbucket REST API for all Bitbucket operations.
 `BITBUCKET_REPO_SLUG` is not available as an env var (multiple repos may be in use). Always derive it from git remote:
 
 ```bash
-BITBUCKET_REPO_SLUG=$(git remote get-url origin | sed 's/.*bitbucket\.org\///' | sed 's/\.git$//')
+BITBUCKET_REPO_SLUG=$(git remote get-url origin | sed 's/.*bitbucket\.org\/[^/]*\///' | sed 's/\.git$//')
 ```
 
 ## Authentication
@@ -18,7 +18,7 @@ Check `$BITBUCKET_EMAIL` first — it determines which auth header to use.
 
 ```bash
 BB_BASE="https://api.bitbucket.org/2.0/repositories/$BITBUCKET_WORKSPACE/$BITBUCKET_REPO_SLUG"  # BITBUCKET_REPO_SLUG from Setup above
-BB_AUTH="Authorization: Basic $(echo -n "$BITBUCKET_EMAIL:$BITBUCKET_API_TOKEN" | base64)"
+BB_AUTH="Authorization: Basic $(echo -n "$BITBUCKET_EMAIL:$BITBUCKET_API_TOKEN" | base64 | tr -d '\n')"
 ```
 
 ### Case 2: `BITBUCKET_EMAIL` is unset → Bearer auth (workspace/repository access token)
@@ -44,13 +44,16 @@ curl -s -H "$BB_AUTH" -H "Accept: application/json" \
   "$BB_BASE/pullrequests?state=OPEN"
 
 # Create a PR
+# IMPORTANT: set BASE_BRANCH before running the curl command.
+# Use the injected base_branch template variable (hotfix → production branch, regular → development branch).
+BASE_BRANCH="{{ base_branch }}"
 curl -s -X POST -H "$BB_AUTH" \
   -H "Content-Type: application/json" -H "Accept: application/json" \
   "$BB_BASE/pullrequests" \
   -d '{
     "title": "KAN-4: short description",
     "source": {"branch": {"name": "KAN-4"}},
-    "destination": {"branch": {"name": "main"}},
+    "destination": {"branch": {"name": "'"$BASE_BRANCH"'"}},
     "description": "PR body"
   }'
 
@@ -59,20 +62,16 @@ curl -s -H "$BB_AUTH" -H "Accept: application/json" \
   "$BB_BASE/pullrequests/42"
 
 # Add a comment to a PR
+# IMPORTANT: always append <!-- ai-runner --> to the comment body so the poller can filter it out.
 curl -s -X POST -H "$BB_AUTH" \
   -H "Content-Type: application/json" -H "Accept: application/json" \
   "$BB_BASE/pullrequests/42/comments" \
-  -d '{"content": {"raw": "comment text"}}'
+  -d '{"content": {"raw": "comment text\n<!-- ai-runner -->"}}'
 
 # List PR comments
 curl -s -H "$BB_AUTH" -H "Accept: application/json" \
   "$BB_BASE/pullrequests/42/comments"
 
-# Merge a PR (squash)
-curl -s -X POST -H "$BB_AUTH" \
-  -H "Content-Type: application/json" -H "Accept: application/json" \
-  "$BB_BASE/pullrequests/42/merge" \
-  -d '{"merge_strategy": "squash", "close_source_branch": true}'
 ```
 
 ## Troubleshooting

@@ -1,6 +1,21 @@
 # Changelog
 
-## [Unreleased]
+## [Unreleased] - 2026-04
+
+### 추가
+- `branch_strategy` 설정: `production` / `development` 브랜치를 `symphony.yaml`에서 레포지토리별로 지정 가능
+  - git clone 시 `--branch` 플래그로 올바른 브랜치에서 클론
+- Slack 질문/답변 메시지에 "✅ 승인 리액션 동작하지 않음" 안내 footer 추가
+- `symphony.yaml` 분리: `WORKFLOW.md`의 YAML front-matter 설정을 독립 파일(`symphony.yaml`)로 분리
+
+### 수정
+- `pendingPlanCount`가 리뷰 단계에서 초기화되지 않아 ✅ 리액션이 차단되던 버그 수정
+- `branch_strategy` 설정 시 git clone이 항상 기본 브랜치(main)로 클론되던 버그 수정
+
+### 변경
+- Slack 이벤트 수신: polling 방식 → Socket Mode (WebSocket) 전환
+
+---
 
 ### 계획 중
 - ai-rules 주입 방법 고려

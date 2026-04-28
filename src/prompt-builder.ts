@@ -13,6 +13,8 @@ export interface PromptExtras {
   trackerKind?: string;
   repositoryKind?: string;
   states?: StatesConfig;
+  /** 이슈 작업의 base 브랜치 (hotfix → prod_branch, 일반 → dev_branch). */
+  baseBranch?: string;
 }
 
 /**
@@ -21,7 +23,7 @@ export interface PromptExtras {
  * @param template  WORKFLOW.md에서 가져온 Liquid 템플릿 문자열
  * @param issue     렌더링할 이슈
  * @param attempt   턴 번호 (1 = 첫 번째 턴, >1 = 이어서 실행)
- * @param extras    추가 템플릿 변수 (tracker_kind, repository_kind)
+ * @param extras    추가 템플릿 변수 (tracker_kind, repository_kind, base_branch)
  */
 export async function buildPrompt(
   template: string,
@@ -35,6 +37,7 @@ export async function buildPrompt(
     tracker_kind: extras?.trackerKind ?? 'tracker',
     repository_kind: extras?.repositoryKind ?? 'github',
     states: extras?.states ?? {},
+    base_branch: extras?.baseBranch ?? 'main',
   };
 
   return engine.parseAndRender(template, context);
