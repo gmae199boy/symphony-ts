@@ -168,6 +168,17 @@ export class SlackThreadManager {
     }
   }
 
+  /** 비활성화된 스레드를 재활성화한다. approvalMessageTs 등 기존 상태는 유지된다. */
+  reactivate(issueIdentifier: string): void {
+    const w = this.threads.get(issueIdentifier);
+    if (w && !w.active) {
+      w.active = true;
+      w.approvedByReaction = false;
+      this.persist();
+      logger.info(`Slack thread manager: reactivated thread for ${issueIdentifier}`);
+    }
+  }
+
   /** 스레드 레코드를 완전히 삭제한다. (terminal state, PR 머지 후 정리용) */
   forgetThread(issueIdentifier: string): void {
     this.threads.delete(issueIdentifier);

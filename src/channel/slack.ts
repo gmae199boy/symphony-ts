@@ -197,6 +197,10 @@ export class SlackChannel implements HumanChannel {
     this.threadManager.forgetThread(issueIdentifier);
   }
 
+  reactivateThread(issueIdentifier: string): void {
+    this.threadManager.reactivate(issueIdentifier);
+  }
+
   private handleSlackEvent(event: SlackResponseEvent): void {
     this.onResponse({
       issueIdentifier: event.issueIdentifier,

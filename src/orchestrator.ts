@@ -37,12 +37,23 @@ import { ContainerAdmissionSet } from './concurrency-limiter.js';
 import { DiffQueueStore } from './slack/diff-queue.js';
 import { DiffSender } from './slack/diff-sender.js';
 import { parseDiffToFiles } from './slack/diff-parser.js';
-import type { Issue, TrackerClient, RepoEvent, AgentMessage, Comment, WorkspaceRef, WorkspaceIO, DispatchReason, IssuePhase } from './types.js';
+import type { Issue, TrackerClient, RepoEvent, AgentMessage, Comment, WorkspaceRef, WorkspaceIO, DispatchReason, IssuePhase, PullRequest } from './types.js';
 import type { Config, TrackerConfig, AgentConfig, ClaudeAgentConfig, CodexAgentConfig, RepositoryConfig } from './config/schema.js';
 import { runSemgrep } from './review/semgrep-runner.js';
 import { formatIssueLabel } from './utils.js';
 
-const WAITING_PHASES: ReadonlySet<IssuePhase> = new Set(['plan_sent', 'pr_plan_sent', 'question_sent', 'review_sent', 'pr_fixing']);
+const WAITING_PHASES: ReadonlySet<IssuePhase> = new Set(['plan_sent', 'pr_plan_sent', 'question_sent', 'review_sent', 'pr_fixing', 'auth_error_waiting']);
+
+type RecoveryDecision =
+  | { action: 'wait';     inferredPhase: IssuePhase }
+  | { action: 'dispatch'; resumeMessage: string }
+  | { action: 'forget' }
+  | { action: 'skip' };
+
+function isAuthenticationError(err: unknown): boolean {
+  const msg = String(err);
+  return msg.includes('authentication_error') || msg.includes('Invalid authentication credentials');
+}
 
 /** diff snippet 업로드에서 제외할 파일 경로 패턴 (lockfile + 시크릿 파일). */
 const DIFF_EXCLUDED_PATH_RE = /(?:^|\/)(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|\.env(?:\..+)?|(?:id_rsa|id_dsa|id_ecdsa|id_ed25519)(?:\.pub)?|[^/]*\.pem|[^/]*\.p12|[^/]*\.pfx|[^/]*\.key|secrets?(?:\.ya?ml)?|credentials?(?:\.json)?|kubeconfig|\.netrc)(?:\s+\(part \s*\d+\/\d+\))?$/i;
@@ -130,6 +141,8 @@ export class Orchestrator extends EventEmitter {
   private retryTimers = new Set<ReturnType<typeof setTimeout>>(); // 재시도 타이머
   private retryTimersByIdentifier = new Map<string, Set<ReturnType<typeof setTimeout>>>(); // identifier → 타이머 역매핑
   private issuePhases = new Map<string, IssuePhase>(); // identifier → 현재 phase
+  /** 인증 오류 직전 phase 보존 — 재로그인 후 재개 시 복원용 */
+  private authErrorPhases = new Map<string, IssuePhase>(); // identifier → auth_error 이전 phase
   private watchedIssues = new Map<string, Issue>(); // identifier → 마지막으로 알려진 Issue
   private queuedComments = new Map<string, { comments: Comment[]; prLabels: string[] }>(); // identifier → 큐에 쌓인 PR 댓글
   private recentlyMerged = new Map<string, number>(); // identifier → 타임스탬프
@@ -141,6 +154,8 @@ export class Orchestrator extends EventEmitter {
   private canceledPendingMap = new Map<string, number>(); // identifier → 최초 감지 타임스탬프
   /** terminateIssue() 동시 호출 방지 — 동일 identifier의 중복 진입을 차단해 Slack 알림 중복 등을 막는다. */
   private inFlightTerminations = new Set<string>(); // identifier
+  /** 레이블 불일치 알림 발송 완료 — 동일 이슈의 폴 반복 시 중복 알림 방지. */
+  private labelMismatchNotified = new Set<string>(); // identifier
   private completedCount = 0;
   private failedCount = 0;
   private repoEvents: RepoEventRecord[] = [];
@@ -399,8 +414,6 @@ export class Orchestrator extends EventEmitter {
         logger.info(`Recovery: found ${workspaces.length} existing workspace(s)`);
       }
 
-      const terminalNorm = this.trackerConfig.terminal_states.map((s) => s.toLowerCase().trim());
-
       // Docker 환경에서만 컨테이너 상태 관리
       const isDocker = this.config.workspace_backend === 'docker';
 
@@ -458,16 +471,6 @@ export class Orchestrator extends EventEmitter {
 
           this.trackWatchedIssue(issue);
 
-          const stateNorm = issue.state.toLowerCase().trim();
-
-          // Terminal state → 스레드 완전 삭제 및 슬롯 반납
-          if (terminalNorm.includes(stateNorm)) {
-            logger.info(`Recovery: ${identifier} in terminal state "${issue.state}"; cleaning up thread`);
-            this.humanChannel?.forgetThread(identifier);
-            this.limiter.release(identifier);
-            continue;
-          }
-
           // phase.json에서 마지막 phase 복원 시도
           const wsRef = this.io.refFromName(ws.name);
           let persistedPhase: IssuePhase | null = null;
@@ -480,47 +483,36 @@ export class Orchestrator extends EventEmitter {
           } catch { /* non-fatal */ }
 
           if (persistedPhase) {
-            this.issuePhases.set(identifier, persistedPhase);
             logger.info(`Recovery: ${identifier} — restored phase "${persistedPhase}" from phase.json`);
-
-            // 대기 phase는 dispatch하지 않음 (인간 승인 대기 중)
-            if (WAITING_PHASES.has(persistedPhase)) {
-              logger.info(`Recovery: ${identifier} in waiting phase "${persistedPhase}" — skipping dispatch`);
-              continue;
-            }
-
-            // 나머지 active phase는 re-dispatch
-            if (!this.running.has(issue.id)) {
-              logger.info(`Recovery: re-dispatching ${identifier} (restored phase="${persistedPhase}")`);
-              this.dispatch(issue, { reason: 'recovery', resumeMessage: '시스템이 재시작되었습니다. 현재 상태를 확인하고 작업을 이어서 진행하세요.' });
-            }
-            continue;
           }
 
-          // phase.json 없음 — 트래커 상태로 추론 (하위 호환)
-          const planReviewNorm = this.trackerConfig.states.plan_review.toLowerCase().trim();
-          const inReviewNorm = this.trackerConfig.states.in_review.toLowerCase().trim();
-          if (stateNorm === planReviewNorm) {
-            this.issuePhases.set(identifier, 'plan_sent');
-            logger.info(`Recovery: ${identifier} in plan_review — inferred plan_sent phase, skipping dispatch`);
-            continue;
+          const decision = this.resolveRecoveryDecision(issue, persistedPhase);
+          switch (decision.action) {
+            case 'forget':
+              logger.info(`Recovery: ${identifier} — terminal/merged, cleaning up`);
+              this.humanChannel?.forgetThread(identifier);
+              this.clearPhase(identifier);
+              this.limiter.release(identifier);
+              break;
+            case 'skip':
+              this.issuePhases.delete(identifier);
+              this.costCommentWritten.delete(identifier);
+              break;
+            case 'wait':
+              // unwatch() + clearPhase() 경쟁 조건: clearPhase가 죽은 컨테이너에서 실패하면
+              // phase.json은 WAITING_PHASE를 유지하지만 active=false가 디스크에 남을 수 있다.
+              // 이 경우 Slack 이벤트(리액션/채팅)가 모두 무시되므로 thread를 재활성화한다.
+              this.issuePhases.set(identifier, decision.inferredPhase);
+              this.humanChannel?.reactivateThread(identifier);
+              logger.info(`Recovery: ${identifier} → waiting phase "${decision.inferredPhase}", skipping dispatch`);
+              break;
+            case 'dispatch':
+              if (!this.running.has(issue.id)) {
+                logger.info(`Recovery: re-dispatching ${identifier} (restored phase="${persistedPhase ?? issue.state}")`);
+                this.dispatch(issue, { reason: 'recovery', resumeMessage: decision.resumeMessage });
+              }
+              break;
           }
-          if (stateNorm === inReviewNorm) {
-            this.issuePhases.set(identifier, 'review_sent');
-            logger.info(`Recovery: ${identifier} in in_review — inferred review_sent phase, skipping dispatch`);
-            continue;
-          }
-
-          const activeNorm = this.trackerConfig.active_states.map((s) => s.toLowerCase().trim());
-          if (!activeNorm.includes(stateNorm)) {
-            logger.info(`Recovery: ${identifier} in state "${issue.state}" (not active); skipping dispatch`);
-            continue;
-          }
-
-          if (this.running.has(issue.id)) continue;
-
-          logger.info(`Recovery: re-dispatching ${identifier} (state="${issue.state}")`);
-          this.dispatch(issue, { reason: 'recovery', resumeMessage: '시스템이 재시작되었습니다. 현재 상태를 확인하고 작업을 이어서 진행하세요.' });
         } catch (err) {
           logger.warn(`Recovery: failed to process workspace ${ws.name}`, { error: String(err) });
         }
@@ -540,22 +532,59 @@ export class Orchestrator extends EventEmitter {
               continue;
             }
 
-            const stateNorm = issue.state.toLowerCase().trim();
-            if (terminalNorm.includes(stateNorm)) {
-              this.humanChannel.forgetThread(id);
-              this.clearPhase(id);
-              continue;
+            const openPR = await this.findOpenPRForIssue(id);
+            const decision = this.resolveRecoveryDecision(issue, null, true, openPR);
+            switch (decision.action) {
+              case 'forget':
+                this.humanChannel.forgetThread(id);
+                this.clearPhase(id);
+                break;
+              case 'skip':
+                this.issuePhases.delete(id);
+                this.costCommentWritten.delete(id);
+                break;
+              case 'wait': {
+                this.issuePhases.set(id, decision.inferredPhase);
+                this.humanChannel.reactivateThread(id);
+                logger.info(`Recovery: ${id} — container lost but waiting state, reactivating thread (no dispatch)`);
+                const waitMsg = openPR
+                  ? `⚠️ *[${formatIssueLabel(issue)}]* 컨테이너가 초기화되었습니다. 기존 PR #${openPR.number} 가 있으므로 새 작업은 시작하지 않습니다. PR 코멘트로 피드백을 보내면 처리됩니다.`
+                  : decision.inferredPhase === 'plan_sent'
+                    ? `⚠️ *[${formatIssueLabel(issue)}]* 컨테이너가 초기화되었습니다. 위 계획을 확인하고 승인(✅) 또는 피드백을 보내주세요.`
+                    : `⚠️ *[${formatIssueLabel(issue)}]* 컨테이너가 초기화되었습니다. 위 리뷰를 확인하고 승인(✅) 또는 피드백을 보내주세요.`;
+                await this.humanChannel.sendNotification(issue, waitMsg).catch((err) => {
+                  logger.warn(`Recovery: failed to notify for ${id}`, { error: String(err) });
+                });
+                break;
+              }
+              case 'dispatch': {
+                logger.info(`Recovery: ${id} — container lost, re-dispatching (state="${issue.state}")`);
+                this.trackWatchedIssue(issue);
+                this.issuePhases.delete(id);
+                this.costCommentWritten.delete(id);
+                await this.humanChannel.sendNotification(
+                  issue,
+                  `⚠️ *[${formatIssueLabel(issue)}]* 컨테이너가 초기화되었습니다. 마지막 체크포인트부터 재개합니다.`,
+                ).catch((err) => {
+                  logger.warn(`Recovery: failed to notify container loss for ${id}`, { error: String(err) });
+                });
+                if (!this.running.has(issue.id)) {
+                  this.dispatch(issue, { reason: 'recovery', resumeMessage: decision.resumeMessage });
+                  if (!this.running.has(issue.id)) {
+                    logger.warn(`Recovery: dispatch failed for ${id} (state="${issue.state}") — container not created`);
+                    void this.humanChannel.sendNotification(
+                      issue,
+                      `⚠️ *[${formatIssueLabel(issue)}]* dispatch 실패: 컨테이너를 생성할 수 없습니다. 컨테이너 cap, 에이전트 라벨, 레포 설정을 확인하세요.`,
+                    ).catch((err) => {
+                      logger.warn(`Recovery: failed to send dispatch failure notification for ${id}`, { error: String(err) });
+                    });
+                  } else {
+                    logger.info(`Recovery: ${id} — dispatch confirmed (state="${issue.state}")`);
+                  }
+                }
+                break;
+              }
             }
-
-            // active 상태인데 컨테이너가 없음 → 알림 후 phase만 초기화 (스레드는 유지)
-            logger.info(`Recovery: ${id} — container lost, notifying and resetting`);
-            await this.humanChannel.sendNotification(
-              issue,
-              `⚠️ *[${formatIssueLabel(issue)}]* 컨테이너가 초기화되었습니다. 이전 작업 컨텍스트가 소실되어 마지막 체크포인트부터 재개합니다.`,
-            ).catch((err) => {
-              logger.warn(`Recovery: failed to notify container loss for ${id}`, { error: String(err) });
-            });
-            this.clearPhase(id);
           } catch (err) {
             logger.warn(`Recovery: failed to check lost container for ${id}`, { error: String(err) });
           }
@@ -621,6 +650,15 @@ export class Orchestrator extends EventEmitter {
       .filter((issue) => !WAITING_PHASES.has(this.issuePhases.get(issue.identifier) as IssuePhase))
       .filter((issue) => !this.recentlyTerminated.has(issue.identifier))
       .filter((issue) => !this.recentlyMerged.has(issue.identifier))
+      .filter((issue) => {
+        // planning 상태 + 기존 Slack 스레드 있음 = 사용자 의도 중지 → 건너뜀
+        const planningNorm = this.trackerConfig.states.planning.toLowerCase().trim();
+        if (issue.state.toLowerCase().trim() === planningNorm && this.humanChannel?.isWatching(issue.identifier)) {
+          logger.debug(`Skipping ${issue.identifier}: planning state with existing thread (user paused)`);
+          return false;
+        }
+        return true;
+      })
       .sort((a, b) => (a.createdAt?.getTime() ?? 0) - (b.createdAt?.getTime() ?? 0));
 
     const alreadyAdmitted = notRunning.filter((i) => this.limiter.has(i.identifier));
@@ -781,6 +819,115 @@ export class Orchestrator extends EventEmitter {
     void this.io.writeFile(ref, '.symphony/phase.json', '').catch(() => {});
   }
 
+  /**
+   * 이슈 identifier 로 등록된 모든 repoPollers 를 순회하며 오픈 PR 을 찾는다.
+   * 일시적 네트워크 오류를 흡수하기 위해 5회 백오프 재시도(200ms → 3.2s, 총 ~6.2초).
+   * 5회 모두 실패하면 null 반환(= "PR 없음" 으로 폴백) + warn 로그.
+   * 컨테이너 소실 복구 시 기존 PR 보호 분기에서 사용한다.
+   */
+  private async findOpenPRForIssue(identifier: string): Promise<PullRequest | null> {
+    const delays = [200, 400, 800, 1600, 3200];
+    let lastErr: unknown = null;
+
+    for (let attempt = 0; attempt < delays.length; attempt++) {
+      let anyPollerSucceeded = false;
+      for (const poller of this.repoPollers.values()) {
+        try {
+          const pr = await poller.findOpenPRByIssue(identifier);
+          anyPollerSucceeded = true;
+          if (pr) return pr;
+        } catch (err) {
+          lastErr = err;
+          logger.debug(`findOpenPRForIssue: poller threw for ${identifier} (attempt ${attempt + 1})`, { error: String(err) });
+        }
+      }
+      if (anyPollerSucceeded) return null;
+      if (attempt < delays.length - 1) await new Promise((r) => setTimeout(r, delays[attempt]));
+    }
+
+    logger.warn(
+      `findOpenPRForIssue: PR lookup failed after ${delays.length} retries for ${identifier} — falling back to dispatch`,
+      { error: String(lastErr) },
+    );
+    return null;
+  }
+
+  private resolveRecoveryDecision(
+    issue: Issue,
+    persistedPhase: IssuePhase | null,
+    containerLost = false,
+    openPR: PullRequest | null = null,
+  ): RecoveryDecision {
+    const identifier = issue.identifier;
+    const stateNorm = issue.state.toLowerCase().trim();
+
+    const terminalNorm = this.trackerConfig.terminal_states.map((s) => s.toLowerCase().trim());
+    const planningNorm = this.trackerConfig.states.planning.toLowerCase().trim();
+    const planReviewNorm = this.trackerConfig.states.plan_review.toLowerCase().trim();
+    const inReviewNorm = this.trackerConfig.states.in_review.toLowerCase().trim();
+    const activeNorm = this.trackerConfig.active_states.map((s) => s.toLowerCase().trim());
+
+    // 1. 최근 종료/머지 → 스레드 정리
+    if (this.recentlyMerged.has(identifier) || this.recentlyTerminated.has(identifier)) {
+      return { action: 'forget' };
+    }
+
+    // 2. Terminal state → 스레드 정리
+    if (terminalNorm.includes(stateNorm)) {
+      return { action: 'forget' };
+    }
+
+    // 3. Planning state → 사용자가 의도적으로 멈춘 것, 건드리지 않음
+    if (stateNorm === planningNorm) {
+      return { action: 'skip' };
+    }
+
+    // 4. Phase 기반 판단 (phase.json에서 복원된 경우)
+    if (persistedPhase !== null) {
+      if (WAITING_PHASES.has(persistedPhase)) {
+        return { action: 'wait', inferredPhase: persistedPhase };
+      }
+      return {
+        action: 'dispatch',
+        resumeMessage: '시스템이 재시작되었습니다. 현재 상태를 확인하고 작업을 이어서 진행하세요.',
+      };
+    }
+
+    // 5. Phase 없음 → 트래커 상태로 추론
+    if (stateNorm === planReviewNorm) {
+      return { action: 'wait', inferredPhase: 'plan_sent' };
+    }
+    if (stateNorm === inReviewNorm) {
+      // 컨테이너 소실 + 기존 PR 존재: 작업 내용이 PR 브랜치에 보존되어 있으므로
+      // dispatch 로 처음부터 다시 시작하지 않고 wait. PR 코멘트가 새로 달리면
+      // handleNewComments 가 자연스럽게 새 dispatch 를 트리거한다.
+      if (containerLost && openPR) {
+        return { action: 'wait', inferredPhase: 'review_sent' };
+      }
+      // 컨테이너가 소실되었고 PR 도 없음: 슬랙 피드백을 처리할 에이전트가 없으므로 dispatch
+      if (containerLost) {
+        return {
+          action: 'dispatch',
+          resumeMessage: '컨테이너가 초기화되었습니다. PR 리뷰 상태를 확인하고, 받은 피드백이 있으면 처리하세요.',
+        };
+      }
+      return { action: 'wait', inferredPhase: 'review_sent' };
+    }
+    if (activeNorm.includes(stateNorm)) {
+      // active 상태에서도 컨테이너 소실 + 기존 PR 존재 시 보존 (review_sent 로 wait)
+      if (containerLost && openPR) {
+        return { action: 'wait', inferredPhase: 'review_sent' };
+      }
+      return {
+        action: 'dispatch',
+        resumeMessage: '시스템이 재시작되었습니다. 현재 상태를 확인하고 작업을 이어서 진행하세요.',
+      };
+    }
+
+    // 6. 그 외 (비활성, 알 수 없음) → skip
+    return { action: 'skip' };
+  }
+
   // ---------------------------------------------------------------------------
   // 에이전트 로그 파일 헬퍼
   // ---------------------------------------------------------------------------
@@ -841,6 +988,17 @@ export class Orchestrator extends EventEmitter {
       logger.info(`No matching agents for ${issue.identifier}; skipping dispatch`);
       this.limiter.release(issue.identifier);
       this.clearPhase(issue.identifier);
+      if (this.humanChannel && !this.labelMismatchNotified.has(issue.identifier)) {
+        this.labelMismatchNotified.add(issue.identifier);
+        const wsName = this.io.nameForIssue(issue);
+        void this.humanChannel.sendNotification(
+          issue,
+          `⚠️ *[${formatIssueLabel(issue)}]* 이슈 라벨이 설정되지 않았거나 매칭되는 에이전트가 없습니다. 이슈에 올바른 라벨을 추가해주세요.`,
+          wsName,
+        ).catch((err) => {
+          logger.warn(`Failed to notify label mismatch for ${issue.identifier}`, { error: String(err) });
+        });
+      }
       return;
     }
 
@@ -849,7 +1007,8 @@ export class Orchestrator extends EventEmitter {
     if (!resolvedRepo && (this.trackerConfig.repositories ?? []).length > 1) {
       logger.warn(`No matching repository for ${issue.identifier}; skipping dispatch (check issue labels)`);
       this.limiter.release(issue.identifier);
-      if (this.humanChannel) {
+      if (this.humanChannel && !this.labelMismatchNotified.has(issue.identifier)) {
+        this.labelMismatchNotified.add(issue.identifier);
         const wsName = this.io.nameForIssue(issue);
         void this.humanChannel.sendNotification(
           issue,
@@ -879,6 +1038,9 @@ export class Orchestrator extends EventEmitter {
 
     // phase에 따른 모델 결정
     const model = this.resolveModel(agents, issue.identifier);
+
+    // 정상 dispatch 확정 — 레이블 불일치 알림 플래그 초기화 (라벨 수정 후 재시도 시 알림 재발송 허용)
+    this.labelMismatchNotified.delete(issue.identifier);
 
     logger.debug(
       `Dispatching issue ${issue.identifier} to ${agents.map((a) => a.kind).join(', ')} agent(s)` +
@@ -990,12 +1152,60 @@ export class Orchestrator extends EventEmitter {
           // phase 기반 포스트프로세싱
           const phase = this.issuePhases.get(issue.identifier) ?? 'initial';
 
+          // 컴팩션 유발 워크플로우 위반 감지:
+          // pending_plan.md와 pr_created.json이 같은 디스패치에서 동시에 존재하는 것은
+          // 항상 위반이다 — 정상 플로우라면 계획 승인 후 새 디스패치에서 구현하므로 공존 불가.
+          {
+            const _ref = this.io.refForIssue(issue);
+            if (await this.io.exists(_ref)) {
+              const [planRaw, prRaw] = await Promise.all([
+                this.io.readFile(_ref, '.symphony/pending_plan.md').catch(() => null),
+                this.io.readFile(_ref, '.symphony/pr_created.json').catch(() => null),
+              ]);
+              if (planRaw?.trim() && prRaw?.trim()) {
+                logger.warn(
+                  `[${issue.identifier}] Compaction-induced workflow violation: ` +
+                  `pending_plan.md and pr_created.json both written in same dispatch (reason=${entry.reason})`,
+                );
+                if (this.humanChannel) {
+                  await this.humanChannel
+                    .sendNotification(
+                      issue,
+                      `⚠️ *[${formatIssueLabel(issue)}]* 컨텍스트 압축으로 인해 계획 승인 없이 코드가 푸시됐습니다. ` +
+                      `PR을 직접 확인해 주세요.`,
+                    )
+                    .catch((err) =>
+                      logger.warn(`Failed to send compaction-violation notification for ${issue.identifier}`, { error: String(err) }),
+                    );
+                }
+                await this.clearPrFeedback(issue);
+                return;
+              }
+            }
+          }
+
           // PR 생성/업데이트 감지를 최우선으로 처리 (phase로 라우팅)
           const prHandled = phase === 'pr_fixing'
             ? await this.handlePrUpdated(issue)
             : await this.handlePrCreated(issue);
 
-          if (phase === 'initial' || phase === 'pr_fixing' || phase === 'review_fixing') {
+          // PR이 셀프리뷰 전에 조기 생성된 경우 경고 (셀프리뷰는 계속 진행해 이미 올라간 PR을 리뷰)
+          if (prHandled && (phase === 'initial' || phase === 'implementing')) {
+            logger.warn(`[${issue.identifier}] PR was created before self-review — running review on already-created PR`);
+            if (this.humanChannel) {
+              void this.humanChannel
+                .sendNotification(
+                  issue,
+                  `⚠️ *[${formatIssueLabel(issue)}]* PR이 셀프리뷰 전에 생성되었습니다. 이미 생성된 PR에 대해 셀프리뷰를 진행합니다.`,
+                )
+                .catch((err) => logger.warn(`Failed to send early-PR warning for ${issue.identifier}`, { error: String(err) }));
+            }
+          }
+
+          // handlePr* 내부에서 setPhase가 호출되었을 수 있으므로 stale 방지를 위해 재조회
+          const currentPhase = this.issuePhases.get(issue.identifier) ?? phase;
+
+          if (currentPhase === 'initial' || currentPhase === 'pr_fixing' || currentPhase === 'review_fixing') {
             // 계획/질문이 있으면 Slack에 보내고 종료 (셀프 리뷰보다 우선)
             const planSent = await this.handlePendingPlan(issue);
             if (planSent) return;
@@ -1010,10 +1220,14 @@ export class Orchestrator extends EventEmitter {
 
           // 셀프리뷰는 새 이슈 첫 구현 완료 시에만 실행 — pr_feedback/review_fix 디스패치는 스킵
           const isPrFixReason = entry.reason === 'pr_feedback' || entry.reason === 'review_fix';
-          if ((phase === 'initial' || phase === 'implementing') && !isPrFixReason) {
+          if ((currentPhase === 'initial' || currentPhase === 'implementing') && !isPrFixReason) {
             const reviewSent = await this.handlePendingReview(issue);
             if (reviewSent) return;
-          } else if (phase === 'review_fixing' && !isPrFixReason) {
+          } else if (currentPhase === 'pr_fixing' && !isPrFixReason) {
+            // 조기 PR 생성 후 셀프리뷰 경로: 이미 올라간 PR을 대상으로 리뷰 전송
+            const reviewSent = await this.handlePendingReview(issue, true);
+            if (reviewSent) return;
+          } else if (currentPhase === 'review_fixing' && !isPrFixReason) {
             // 에이전트가 pending_review.md를 수정했으면 재전송, 새 리뷰 생성은 안 함
             const reviewSent = await this.handlePendingReview(issue, true);
             if (reviewSent) return;
@@ -1052,6 +1266,13 @@ export class Orchestrator extends EventEmitter {
           return;
         }
 
+        // 오케스트레이터 shutdown 중이면 컨테이너 정리 없이 즉시 반환 (재시작 후 복구)
+        if (this.stopped) {
+          this.clearPhase(issue.identifier);
+          this.emit('agent:failed', issue, err);
+          return;
+        }
+
         // 이슈가 여전히 활성 상태이고 재시도 횟수가 남은 경우 자동 재시도
         const maxRetries = this.config.agents.max_retries;
         const isMaxTurns = String(err).includes('error_max_turns');
@@ -1060,11 +1281,15 @@ export class Orchestrator extends EventEmitter {
             const [refreshed] = await this.tracker.fetchIssuesByIds([issue.id]);
             if (refreshed) {
               const activeNorm = this.trackerConfig.active_states.map((s) => s.toLowerCase().trim());
-              if (activeNorm.includes(refreshed.state.toLowerCase().trim())) {
+              const terminalNorm = this.trackerConfig.terminal_states.map((s) => s.toLowerCase().trim());
+              const stateNorm = refreshed.state.toLowerCase().trim();
+              // max_turns는 기술적 한계로 이슈 상태 무관하게 재시도 — 완료/취소(terminal)일 때만 예외
+              const shouldRetry = isMaxTurns ? !terminalNorm.includes(stateNorm) : activeNorm.includes(stateNorm);
+              if (shouldRetry) {
                 const delayMs = this.config.agents.retry_backoff_ms * Math.pow(2, retryCount);
                 logger.info(`Retrying ${issue.identifier} in ${delayMs}ms (retry ${retryCount + 1}/${maxRetries})${isMaxTurns ? ' [max_turns reached]' : ''}`);
                 const resumeMessage = isMaxTurns
-                  ? '최대 턴 수에 도달해 재시도합니다. 현재 워크스페이스 상태를 확인하고 작업을 이어서 진행하세요.'
+                  ? '최대 턴 수에 도달해 재시도합니다. 현재 워크스페이스 상태를 확인하고 작업을 이어서 진행하세요.\n\n**중요**: 절대 `git push`하거나 PR을 생성하지 마세요. 구현이 완료되면 final commit 후 종료하세요 — 오케스트레이터가 셀프리뷰를 실행합니다. (이미 PR이 존재하는 phase에서 재시작된 경우, 워크패드의 컨텍스트와 `.symphony/pr_feedback.json` 존재 여부로 현재 단계를 판단하세요.)'
                   : '이전 실행이 실패했습니다. 현재 상태를 확인하고 작업을 이어서 진행하세요.';
                 const timer = setTimeout(() => {
                   this.retryTimers.delete(timer);
@@ -1086,14 +1311,26 @@ export class Orchestrator extends EventEmitter {
           }
         }
 
-        // 재시도 없이 완전히 실패 — 워크스페이스 정리 후 슬롯 해제
-        try {
-          const backend = createWorkspaceBackend(this.config, this.resolveRepository(issue) ?? undefined, this.trackerConfig);
-          const ref = this.io.refForIssue(issue);
-          await backend.cleanup(ref, issue);
-        } catch (cleanupErr) {
-          logger.warn(`Workspace cleanup failed for ${issue.identifier} after retries exhausted`, { error: String(cleanupErr) });
+        // 인증 오류 — 컨테이너 보존, 슬롯 해제, 재로그인 후 기존 컨테이너 재사용
+        if (isAuthenticationError(err)) {
+          this.limiter.release(issue.identifier);
+          const prevPhase = this.issuePhases.get(issue.identifier) ?? 'initial';
+          this.authErrorPhases.set(issue.identifier, prevPhase as IssuePhase);
+          this.setPhase(issue.identifier, 'auth_error_waiting');
+          this.failedCount++;
+          if (this.humanChannel) {
+            const text = `🔑 *[${formatIssueLabel(issue)}]* 인증이 만료되었습니다.\n\n\`claude login\`으로 재로그인 후 이 스레드에 메시지를 보내주세요.`;
+            void this.humanChannel.sendNotification(issue, text).catch((notifyErr) => {
+              logger.warn(`Failed to send auth error notification for ${issue.identifier}`, { error: String(notifyErr) });
+            });
+            this.logConversationToTracker(issue.id, '[Bot]', text);
+            // 스레드 유지 (unwatch 호출 안 함 — 재로그인 후 메시지 수신 필요)
+          }
+          this.emit('agent:failed', issue, err);
+          return;
         }
+
+        // 재시도 소진 — 컨테이너 보존, 슬롯 해제 (terminateIssue가 canceled/pr_merged 시 최종 정리)
         this.limiter.release(issue.identifier);
         this.clearPhase(issue.identifier);
         this.failedCount++;
@@ -1345,22 +1582,9 @@ export class Orchestrator extends EventEmitter {
     logger.info(`Issue ${issue.identifier} reached terminal state; cleaning up workspace`);
     this.clearPhase(issue.identifier);
 
-    let cleaned = false;
-    try {
-      const backend = createWorkspaceBackend(this.config, this.resolveRepository(latest ?? issue) ?? undefined, this.trackerConfig);
-      const ref = this.io.refForIssue(issue);
-      await backend.cleanup(ref, latest);
-      cleaned = true;
-    } catch (err) {
-      logger.warn('Workspace cleanup failed', { issue: issue.identifier, error: String(err) });
-    }
-
-    if (cleaned) {
-      // 컨테이너가 정리되었으므로 admission 슬롯 해제
-      this.limiter.release(issue.identifier);
-      logger.debug(`Released container slot for ${issue.identifier} (admitted=${this.limiter.size()}/${this.limiter.maxContainers})`);
-    }
-    // cleaned=false: 슬롯 유지 — pruneOrphanedAdmissions가 워크스페이스 소멸 감지 후 수거
+    // 컨테이너 삭제는 terminateIssue(canceled/pr_merged)에 위임; 여기서는 슬롯만 해제
+    this.limiter.release(issue.identifier);
+    logger.debug(`Released container slot for ${issue.identifier} (admitted=${this.limiter.size()}/${this.limiter.maxContainers})`);
   }
 
   // ---------------------------------------------------------------------------
@@ -1554,7 +1778,7 @@ export class Orchestrator extends EventEmitter {
         // 에이전트 리뷰 라운드와 semgrep을 병렬로 실행
         // Promise.allSettled: 한쪽 실패 시에도 다른 쪽 결과를 보존
         const [reviewSettled, semgrepSettled] = await Promise.allSettled([
-          this.runReviewRounds(ref),
+          this.runReviewRounds(ref, issue),
           this.runSemgrepIfConfigured(ref, baseBranch),
         ]);
         const rawResults = reviewSettled.status === 'fulfilled' ? reviewSettled.value : '';
@@ -1568,9 +1792,55 @@ export class Orchestrator extends EventEmitter {
           logger.warn(`No review results for ${issue.identifier} — skipping consolidation`);
           await this.io.writeFile(ref, '.symphony/pending_review.md', '리뷰 결과 없음 — 수동 확인 필요');
         } else {
-          await this.consolidateReviewViaContinue(ref, rawResults, semgrepResults);
+          // consolidation만 별도 try/catch — 실패 시 rawResults fallback으로 계속 진행
+          try {
+            await this.consolidateReviewViaContinue(ref, rawResults, semgrepResults);
+          } catch (consolidationErr) {
+            let currentErr: unknown = consolidationErr;
+            while (String(currentErr).includes('error_max_turns')) {
+              logger.info(`Consolidation hit max_turns for ${issue.identifier} — retrying with --continue`);
+              if (this.humanChannel) {
+                void this.humanChannel
+                  .sendNotification(
+                    issue,
+                    `🔄 *[${formatIssueLabel(issue)}]* 셀프리뷰 통합에서 최대 턴 수에 도달해 이어서 재시도합니다.`,
+                    this.io.nameForIssue(issue),
+                  )
+                  .catch((notifyErr) => logger.warn('Failed to send consolidation retry notification', { error: String(notifyErr) }));
+              }
+              const mainKind = (this.config.agents.backends.find((a) => a.primary) ?? this.config.agents.backends[0]).kind;
+              try {
+                await this.spawnReviewCLI(
+                  ref, mainKind,
+                  '최대 턴 수에 도달했습니다. pending_review.md 작성을 완료해 주세요.',
+                  { continue: true },
+                );
+                currentErr = null;
+              } catch (retryErr) {
+                currentErr = retryErr;
+              }
+            }
+            if (currentErr) {
+              logger.warn(
+                `Review consolidation failed for ${issue.identifier}; using raw results as fallback`,
+                { error: String(currentErr) },
+              );
+            }
+            // 에이전트가 이미 부분 결과를 작성했으면 그것을 유지, 없을 때만 rawResults fallback 사용
+            const existing = await this.io.readFile(ref, '.symphony/pending_review.md');
+            if (!existing?.trim()) {
+              const MAX_RAW = 32 * 1024;
+              const raw = rawResults ? sanitizeForSlack(rawResults.slice(0, MAX_RAW)) : null;
+              const seg = semgrepResults ? sanitizeForSlack(semgrepResults) : null;
+              const header = raw || seg
+                ? '> ⚠️ 셀프리뷰 통합 단계에서 오류가 발생했습니다. 아래는 정리되지 않은 원본 리뷰 결과입니다.\n'
+                : null;
+              const parts = [header, raw, seg].filter((x): x is string => Boolean(x));
+              await this.io.writeFile(ref, '.symphony/pending_review.md', parts.join('\n\n'));
+            }
+          }
 
-          // 에이전트가 pending_review.md를 작성했는지 확인
+          // 에이전트가 pending_review.md를 작성했는지(또는 위 fallback이 채워졌는지) 확인
           const consolidated = await this.io.readFile(ref, '.symphony/pending_review.md');
           if (!consolidated?.trim()) {
             logger.warn(`Review consolidation did not produce pending_review.md for ${issue.identifier}`);
@@ -1581,7 +1851,22 @@ export class Orchestrator extends EventEmitter {
         reviewText = (await this.io.readFile(ref, '.symphony/pending_review.md'))?.trim() ?? undefined;
       } catch (err) {
         logger.error(`Self-review failed for ${issue.identifier}`, { error: String(err) });
-        return false;
+        // 잔류 파일이 다음 dispatch에서 "기존 리뷰"로 오인되지 않도록 초기화
+        await this.io.writeFile(ref, '.symphony/pending_review.md', '').catch(() => {});
+        // 리뷰 라운드 자체 실패 등 진짜 복구 불가 상황 — Slack 알림 후 throw로 notifyWorkComplete 스킵
+        if (this.humanChannel) {
+          const label = formatIssueLabel(issue);
+          const errStr = String(err).slice(0, 300).replace(/`/g, "'");
+          await this.humanChannel
+            .sendNotification(
+              issue,
+              `⚠️ *[${label}]* 셀프리뷰 실행 중 오류가 발생했습니다. 수동으로 확인이 필요합니다.\n\`\`\`${errStr}\`\`\``,
+            )
+            .catch((notifyErr) => {
+              logger.error(`Failed to send self-review failure notification for ${issue.identifier}`, { error: String(notifyErr) });
+            });
+        }
+        throw err;
       }
     }
 
@@ -1613,7 +1898,7 @@ export class Orchestrator extends EventEmitter {
    * 리뷰 에이전트는 @code-reviewer와 @security-engineer 서브 에이전트를 사용한다.
    */
   /** 설정된 모든 리뷰 에이전트를 병렬로 실행한다 (각 에이전트는 직렬 라운드 수행). 원시 결과 텍스트를 반환한다. */
-  private async runReviewRounds(ref: WorkspaceRef): Promise<string> {
+  private async runReviewRounds(ref: WorkspaceRef, issue: Issue): Promise<string> {
     const reviewConfig = this.config.agents.review;
     if (!reviewConfig) throw new Error('Self-review requires agents.review config');
     const { kinds: agents, rounds } = reviewConfig;
@@ -1621,7 +1906,7 @@ export class Orchestrator extends EventEmitter {
     logger.info(`Starting self-review: agents=[${agents.join(', ')}] rounds=${rounds}`);
 
     const perAgentResults = await Promise.all(
-      agents.map((kind) => this.runAgentReviewRounds(ref, kind, rounds)),
+      agents.map((kind) => this.runAgentReviewRounds(ref, kind, rounds, issue)),
     );
 
     // 라벨 포함 결과 목록 (어느 에이전트의 몇 번째 라운드인지 명시)
@@ -1675,13 +1960,36 @@ export class Orchestrator extends EventEmitter {
   }
 
   /** 한 에이전트를 `rounds`번의 직렬 리뷰 라운드로 실행하고 결과를 수집한다. */
-  private async runAgentReviewRounds(ref: WorkspaceRef, kind: string, rounds: number): Promise<string[]> {
+  private async runAgentReviewRounds(ref: WorkspaceRef, kind: string, rounds: number, issue: Issue): Promise<string[]> {
     const results: string[] = [];
     for (let round = 1; round <= rounds; round++) {
       logger.info(`Review ${kind} round ${round}/${rounds}`);
       try {
-        const prompt = this.buildReviewPrompt(round, rounds, results);
-        const result = await this.spawnReviewCLI(ref, kind, prompt);
+        let result!: string;
+        let isFirstAttempt = true;
+        while (true) {
+          try {
+            if (isFirstAttempt) {
+              result = await this.spawnReviewCLI(ref, kind, this.buildReviewPrompt(round, rounds, results), { saveSession: true });
+            } else {
+              result = await this.spawnReviewCLI(ref, kind, '최대 턴 수에 도달했습니다. 중단된 리뷰를 완료하고 결과를 출력해 주세요.', { continue: true });
+            }
+            break;
+          } catch (roundErr) {
+            if (!String(roundErr).includes('error_max_turns')) throw roundErr;
+            isFirstAttempt = false;
+            logger.info(`Review ${kind} round ${round} hit max_turns — retrying with --continue`);
+            if (this.humanChannel) {
+              void this.humanChannel
+                .sendNotification(
+                  issue,
+                  `🔄 *[${formatIssueLabel(issue)}]* 셀프리뷰 ${kind} 라운드 ${round}에서 최대 턴 수에 도달해 이어서 재시도합니다.`,
+                  this.io.nameForIssue(issue),
+                )
+                .catch((notifyErr) => logger.warn('Failed to send review round retry notification', { error: String(notifyErr) }));
+            }
+          }
+        }
         results.push(result);
       } catch (err) {
         logger.warn(`Review ${kind} round ${round} failed`, { error: String(err) });
@@ -1700,7 +2008,7 @@ export class Orchestrator extends EventEmitter {
   }
 
   /** 리뷰 에이전트(claude 또는 codex)를 위한 통합 CLI 실행기. 기본적으로 격리된 세션, 통합 시에는 --continue 사용. */
-  private spawnReviewCLI(ref: WorkspaceRef, kind: string, prompt: string, opts?: { continue?: boolean }): Promise<string> {
+  private spawnReviewCLI(ref: WorkspaceRef, kind: string, prompt: string, opts?: { continue?: boolean; saveSession?: boolean }): Promise<string> {
     const agentConfig = this.config.agents.backends.find((a) => a.kind === kind);
     if (!agentConfig) throw new Error(`No agent config found for kind="${kind}"`);
 
@@ -1714,7 +2022,9 @@ export class Orchestrator extends EventEmitter {
       timeoutMs = config.turn_timeout_ms;
       const args = opts?.continue
         ? ['--continue', '-p', prompt, '--output-format', 'text']
-        : ['-p', prompt, '--no-session-persistence'];
+        : opts?.saveSession
+          ? ['-p', prompt, '--output-format', 'text']
+          : ['-p', prompt, '--no-session-persistence'];
       if (ref.containerName) {
         args.push('--dangerously-skip-permissions');
         cmd = 'docker';
@@ -1974,6 +2284,14 @@ export class Orchestrator extends EventEmitter {
           }
           break;
 
+        case 'auth_error_waiting': {
+          // 인증 오류 후 슬랙 메시지 수신 — 이전 phase로 복원 후 재디스패치
+          const prevPhase = this.authErrorPhases.get(identifier) ?? 'initial';
+          this.authErrorPhases.delete(identifier);
+          this.setPhase(identifier, prevPhase as IssuePhase);
+          break;
+        }
+
         default:
           break;
       }
@@ -1998,14 +2316,18 @@ export class Orchestrator extends EventEmitter {
 
       // 메시지 구성: ✅ 리액션 그대로 전달 (에이전트가 ✅ 존재 여부로 구현 여부 판단)
       // 비승인 메시지에는 방어 prefix 추가 — 에이전트가 텍스트 내용에 현혹되어 구현하는 것 방지
-      const resumeMessage = event.isApproval
-        ? '✅'
-        : `⚠️ FEEDBACK (NOT APPROVAL — do NOT implement):\n${event.responseText}`;
+      const wasAuthError = (currentPhase === 'auth_error_waiting');
+      const resumeMessage = wasAuthError
+        ? '인증이 복구되었습니다. 현재 워크스페이스 상태를 확인하고 작업을 이어서 진행하세요.'
+        : event.isApproval
+          ? '✅'
+          : `⚠️ FEEDBACK (NOT APPROVAL — do NOT implement):\n${event.responseText}`;
 
       // reason 결정
       const finalPhase = this.issuePhases.get(identifier) ?? 'initial';
-      const reason: DispatchReason =
-        (finalPhase === 'review_fixing' && event.isApproval) ? 'review_fix'
+      const reason: DispatchReason = wasAuthError
+        ? 'slack_response'
+        : (finalPhase === 'review_fixing' && event.isApproval) ? 'review_fix'
         : (finalPhase === 'pr_fixing') ? 'pr_feedback'
         : 'slack_response';
 
@@ -2294,6 +2616,7 @@ export class Orchestrator extends EventEmitter {
       // 중복 터미네이트 방지 플래그 (recentlyMerged와 동일 패턴)
       this.recentlyTerminated.set(identifier, Date.now());
       this.missingTickCounts.delete(identifier);
+      this.labelMismatchNotified.delete(identifier);
 
       logger.info('terminateIssue', { identifier, reason: opts.reason });
 
@@ -2758,6 +3081,14 @@ export class Orchestrator extends EventEmitter {
 // ---------------------------------------------------------------------------
 // 헬퍼
 // ---------------------------------------------------------------------------
+
+function sanitizeForSlack(text: string): string {
+  return text
+    .replace(/<!(?:channel|here|everyone)>/g, '[알림차단]')
+    .replace(/<@[A-Z0-9]+>/g, '[멘션차단]')
+    .replace(/<([^|>]+)\|([^>]+)>/g, '$2')
+    .replace(/`{3}/g, "'''");
+}
 
 function createTrackerClient(config: TrackerConfig): TrackerClient {
   if (config.kind === 'linear') return new LinearClient(config);

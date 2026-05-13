@@ -45,6 +45,12 @@ export interface HumanChannel {
   unwatch(issueIdentifier: string): void;
 
   /**
+   * 비활성화된 스레드를 재활성화한다. approvalMessageTs 등 기존 상태는 그대로 유지된다.
+   * clearPhase 실패로 phase.json이 WAITING_PHASE를 유지했지만 active=false인 경우 복구에 사용.
+   */
+  reactivateThread(issueIdentifier: string): void;
+
+  /**
    * 스레드/감시 레코드를 완전히 삭제한다.
    * terminal state 도달, PR 머지 등 이슈가 종료될 때 호출한다.
    */

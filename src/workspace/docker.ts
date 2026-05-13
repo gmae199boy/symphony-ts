@@ -357,11 +357,24 @@ async function injectGitCredentials(container: string, repository?: RepositoryCo
     return;
   }
 
+  // git user.name / user.email: GIT_USER_* 우선, Bitbucket 레포 설정 폴백
+  const gitUserName =
+    process.env['GIT_USER_NAME'] ??
+    (repository?.kind === 'bitbucket' ? (repository.username ?? process.env['BITBUCKET_USERNAME']) : undefined);
+  const gitUserEmail =
+    process.env['GIT_USER_EMAIL'] ??
+    (repository?.kind === 'bitbucket' ? (repository.email ?? process.env['BITBUCKET_EMAIL']) : undefined);
+
   const credContent = lines.join('\n') + '\n';
+  const userConfigCmds = [
+    ...(gitUserName ? [`git config --global user.name ${JSON.stringify(gitUserName)}`] : []),
+    ...(gitUserEmail ? [`git config --global user.email ${JSON.stringify(gitUserEmail)}`] : []),
+  ].join(' && ');
   const script =
     'git config --global credential.helper store && ' +
     'cat > /home/worker/.git-credentials && ' +
-    'chmod 600 /home/worker/.git-credentials';
+    'chmod 600 /home/worker/.git-credentials' +
+    (userConfigCmds ? ` && ${userConfigCmds}` : '');
 
   const result = await spawnAsync(
     'docker',

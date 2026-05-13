@@ -28,7 +28,9 @@
       "WebFetch(domain:status.claude.com)",
       "Bash(git *)",
       "Bash(pnpm test *)",
-      "WebFetch(domain:docs.anthropic.com)"
+      "WebFetch(domain:docs.anthropic.com)",
+      "Bash(awk 'NR>=5155 && NR<=5200' /Users/myunghun/Github/ai-runner/logs/DEVKMH-27.log)",
+      "Bash(python3 -c ' *)"
     ]
   }
 }

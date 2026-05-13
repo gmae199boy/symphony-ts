@@ -11,6 +11,9 @@ import { logger } from '../logger.js';
 import type { WorkspaceRef } from '../types.js';
 import type { SemgrepConfig } from '../config/schema.js';
 
+// 락파일·자동 생성 파일은 semgrep 스캔 대상에서 제외 (OOM 방지)
+const SEMGREP_EXCLUDED_RE = /(?:^|\/)(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lock|composer\.lock|Gemfile\.lock|Cargo\.lock|go\.sum|poetry\.lock)$/i;
+
 // ---------------------------------------------------------------------------
 // semgrep JSON 출력 타입 (필요한 필드만 정의)
 // ---------------------------------------------------------------------------
@@ -67,9 +70,15 @@ export async function runSemgrep(
       return null;
     }
 
-    logger.info(`[semgrep] ${filteredFiles.length}개 대상 스캔 시작`);
+    const scanTargets = filteredFiles.filter((f) => !SEMGREP_EXCLUDED_RE.test(f));
+    if (scanTargets.length === 0) {
+      logger.info('[semgrep] 변경 파일 전체가 제외 대상(락파일 등) — 스캔 건너뜀');
+      return null;
+    }
 
-    const rawOutput = await spawnSemgrep(ref, config, filteredFiles);
+    logger.info(`[semgrep] ${scanTargets.length}개 대상 스캔 시작`);
+
+    const rawOutput = await spawnSemgrep(ref, config, scanTargets);
     if (rawOutput === null) return null;
 
     const parsed = parseSemgrepOutput(rawOutput);

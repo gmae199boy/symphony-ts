@@ -27,6 +27,9 @@ interface PollerState {
   firstPoll: boolean;
 }
 
+// Allowed characters in repo/workspace/repo_slug used to build the state file name.
+const SAFE_LABEL_RE = /^[a-zA-Z0-9_./-]+$/;
+
 export class RepoPoller extends Poller {
   private readonly config: RepositoryConfig;
   private readonly repoClient: RepoClientApi;
@@ -40,12 +43,27 @@ export class RepoPoller extends Poller {
     this.onEvent = onEvent;
     this.repoClient = createRepoClient(config);
 
-    // Determine state file path for persistence
     if (workspaceRoot) {
-      const label = config.kind === 'github' ? config.repo.replace(/\//g, '-') : `${config.workspace}-${config.repo_slug}`;
-      this.stateFilePath = path.join(workspaceRoot, `repo-poller-${label}-seen.json`);
+      const label = this.makeStateLabel(config);
+      this.stateFilePath = label ? path.join(workspaceRoot, `repo-poller-${label}-seen.json`) : null;
     } else {
       this.stateFilePath = null;
+    }
+  }
+
+  private makeStateLabel(config: RepositoryConfig): string | null {
+    if (config.kind === 'github') {
+      if (!SAFE_LABEL_RE.test(config.repo)) {
+        logger.warn('RepoPoller: unsafe repo name, disabling state persistence', { repo: config.repo });
+        return null;
+      }
+      return config.repo.replace(/\//g, '-');
+    } else {
+      if (!SAFE_LABEL_RE.test(config.workspace) || !SAFE_LABEL_RE.test(config.repo_slug)) {
+        logger.warn('RepoPoller: unsafe workspace or repo_slug, disabling state persistence');
+        return null;
+      }
+      return `${config.workspace}-${config.repo_slug}`;
     }
   }
 
@@ -76,10 +94,16 @@ export class RepoPoller extends Poller {
       );
     }
 
+    const currentOpenNumbers = new Set(prs.map((pr) => pr.number));
+
     // Detect PRs that disappeared from the open list (potentially merged)
     if (!this.state.firstPoll) {
-      await this.detectMergedPRs(prs);
+      await this.detectMergedPRs(currentOpenNumbers);
     }
+
+    // On every poll, but only effective on the first poll after restart (knownOpenPRs is empty then).
+    // Verifies each candidate with fetchPR to avoid deleting entries for transiently-missing PRs.
+    await this.cleanupOrphanedSeen(currentOpenNumbers);
 
     for (const pr of prs) {
       await this.checkPR(pr);
@@ -89,19 +113,37 @@ export class RepoPoller extends Poller {
     this.state.knownOpenPRs = new Map(prs.map((pr) => [pr.number, pr]));
 
     this.state.firstPoll = false;
+
+    // Single persist point for the entire poll cycle.
+    this.persistState();
   }
 
   private async fetchOpenPRs(): Promise<PullRequest[]> {
     return this.repoClient.fetchOpenPRs();
   }
 
+  /**
+   * 이슈 identifier 로 매칭되는 오픈 PR 을 찾는다. 복구 경로에서 사용.
+   * - 캐시(knownOpenPRs)가 채워져 있으면 캐시 우선.
+   * - 캐시가 비어있으면 (부팅 직후 첫 폴 전) 1회 fetch 후 캐시 시드.
+   * - fetch 실패 시 호출자가 폴백할 수 있도록 throw 한다.
+   */
+  async findOpenPRByIssue(identifier: string): Promise<PullRequest | null> {
+    for (const pr of this.state.knownOpenPRs.values()) {
+      if (pr.issueIdentifier === identifier) return pr;
+    }
+    if (this.state.knownOpenPRs.size > 0) return null;
+
+    const prs = await this.repoClient.fetchOpenPRs();
+    this.state.knownOpenPRs = new Map(prs.map((p) => [p.number, p]));
+    return prs.find((p) => p.issueIdentifier === identifier) ?? null;
+  }
+
   // ---------------------------------------------------------------------------
   // Merged PR detection
   // ---------------------------------------------------------------------------
 
-  private async detectMergedPRs(currentOpenPRs: PullRequest[]): Promise<void> {
-    const currentOpenNumbers = new Set(currentOpenPRs.map((pr) => pr.number));
-
+  private async detectMergedPRs(currentOpenNumbers: Set<number>): Promise<void> {
     for (const [prNumber, knownPR] of this.state.knownOpenPRs) {
       if (currentOpenNumbers.has(prNumber)) continue;
 
@@ -121,6 +163,49 @@ export class RepoPoller extends Poller {
       // Clean up seen data for this PR
       this.state.seen.delete(prNumber);
     }
+  }
+
+  private async cleanupOrphanedSeen(currentOpenNumbers: Set<number>): Promise<void> {
+    const candidates: number[] = [];
+    for (const prNumber of this.state.seen.keys()) {
+      if (currentOpenNumbers.has(prNumber)) continue;
+      if (this.state.knownOpenPRs.has(prNumber)) continue; // handled by detectMergedPRs
+      candidates.push(prNumber);
+    }
+    if (candidates.length === 0) return;
+
+    const toDelete: number[] = [];
+    for (const prNumber of candidates) {
+      try {
+        const pr = await this.fetchPR(prNumber);
+        if (pr?.state === 'open') {
+          // PR is still open (e.g., label temporarily removed) — preserve seen entry
+          logger.debug(`RepoPoller: orphan PR #${prNumber} is still open, preserving seen entry`);
+          continue;
+        }
+        toDelete.push(prNumber);
+      } catch (err) {
+        // Network error — keep entry conservatively to avoid false-positive wipe
+        logger.debug('RepoPoller: failed to verify orphan PR state, preserving entry', { pr: prNumber, error: String(err) });
+      }
+    }
+
+    if (toDelete.length === 0) return;
+
+    const seenSizeBefore = this.state.seen.size;
+    for (const prNumber of toDelete) {
+      this.state.seen.delete(prNumber);
+    }
+
+    if (toDelete.length >= Math.max(3, seenSizeBefore * 0.5)) {
+      logger.warn('RepoPoller: large number of orphaned seen entries cleaned up', {
+        count: toDelete.length,
+        total: seenSizeBefore,
+      });
+    } else {
+      logger.info('RepoPoller: cleaned up orphaned seen entries', { count: toDelete.length });
+    }
+    logger.debug('RepoPoller: orphaned seen entry details', { prNumbers: toDelete });
   }
 
   private async fetchPR(prNumber: number): Promise<PullRequest | null> {
@@ -150,7 +235,7 @@ export class RepoPoller extends Poller {
     }
 
     this.state.seen.set(pr.number, updatedSeen);
-    this.persistState();
+    // State is persisted once at the end of doPoll.
   }
 
   private async fetchPRComments(prNumber: number): Promise<Comment[]> {
@@ -205,8 +290,18 @@ export class RepoPoller extends Poller {
       }
       fs.mkdirSync(path.dirname(this.stateFilePath), { recursive: true });
       const tmpPath = this.stateFilePath + '.tmp';
-      fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
-      fs.renameSync(tmpPath, this.stateFilePath);
+      fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), { encoding: 'utf8', mode: 0o600 });
+      try {
+        fs.renameSync(tmpPath, this.stateFilePath);
+      } catch (renameErr) {
+        // Cross-filesystem rename can fail — clean up the temp file and rethrow
+        try {
+          fs.unlinkSync(tmpPath);
+        } catch {
+          // ignore cleanup failure
+        }
+        throw renameErr;
+      }
     } catch (err) {
       logger.warn('RepoPoller: failed to persist state', { error: String(err) });
     }
@@ -216,15 +311,28 @@ export class RepoPoller extends Poller {
     if (!this.stateFilePath) return;
     try {
       const raw = fs.readFileSync(this.stateFilePath, 'utf8');
-      const data = JSON.parse(raw) as Record<string, string[]>;
-      for (const [prNumber, commentIds] of Object.entries(data)) {
-        this.state.seen.set(Number(prNumber), { commentIds: new Set(commentIds) });
+      const parsed: unknown = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        logger.warn('RepoPoller: state file has unexpected format, starting fresh');
+        return;
+      }
+      const data = parsed as Record<string, unknown>;
+      for (const [key, val] of Object.entries(data)) {
+        if (!/^\d+$/.test(key)) {
+          logger.warn('RepoPoller: skipping invalid state key', { key });
+          continue;
+        }
+        if (!Array.isArray(val) || !val.every((v) => typeof v === 'string')) {
+          logger.warn('RepoPoller: skipping invalid state entry', { pr: Number(key) });
+          continue;
+        }
+        this.state.seen.set(Number(key), { commentIds: new Set(val) });
       }
       // Restored from disk → not a true first poll
       this.state.firstPoll = false;
       logger.info('RepoPoller: restored seen state from disk', { prs: this.state.seen.size });
     } catch {
-      // No file or corrupted — start fresh (firstPoll stays true)
+      // No file or parse error — start fresh (firstPoll stays true)
     }
   }
 

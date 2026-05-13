@@ -113,12 +113,13 @@ export type DispatchReason = 'new_issue' | 'recovery' | 'pr_feedback' | 'slack_r
 export type IssuePhase =
   | 'initial'
   | 'plan_sent'
-  | 'pr_plan_sent'   // PR 피드백 계획 대기 (plan_sent와 달리 승인 시 pr_fixing으로 복귀)
+  | 'pr_plan_sent'         // PR 피드백 계획 대기 (plan_sent와 달리 승인 시 pr_fixing으로 복귀)
   | 'implementing'
   | 'question_sent'
   | 'review_sent'
   | 'review_fixing'
-  | 'pr_fixing';
+  | 'pr_fixing'
+  | 'auth_error_waiting';  // 인증 오류 후 재로그인 대기 — 슬랙 메시지 수신 시 재개
 
 export interface RepoEvent {
   kind: RepoEventKind;
